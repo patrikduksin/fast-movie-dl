@@ -291,7 +291,7 @@ fn probe_candidate(
     let stderr_text = read_stderr(&mut child);
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
-    let sample_bytes = size_or_zero(&out_path);
+    let sample_bytes = sampled_bytes_or_zero(&out_path);
 
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -326,8 +326,26 @@ fn probe_candidate(
     })
 }
 
-fn size_or_zero(path: &PathBuf) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+fn sampled_bytes_or_zero(path: &PathBuf) -> u64 {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return 0;
+    };
+
+    let logical_len = metadata.len();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let allocated = metadata.blocks().saturating_mul(512);
+        if allocated > 0 {
+            // aria2 probes can create sparse files when split/range requests are enabled.
+            // Logical length may jump to near full file size early, so prefer allocated bytes.
+            return allocated.min(logical_len);
+        }
+    }
+
+    logical_len
 }
 
 fn read_stderr(child: &mut std::process::Child) -> String {

@@ -265,6 +265,8 @@ fn run_speed_test() -> Result<i32> {
         .filter_map(|attempt| attempt.result.clone())
         .collect();
 
+    print_download_time_estimates(&successful);
+
     if let Some((winner, runner_up)) = rank_probes(&successful) {
         if let Some(second) = runner_up {
             let lead = percent_lead(winner.mbps, second.mbps);
@@ -298,6 +300,84 @@ fn run_speed_test() -> Result<i32> {
     }
 
     Ok(0)
+}
+
+fn print_download_time_estimates(successful: &[SpeedProbeResult]) {
+    if successful.is_empty() {
+        return;
+    }
+
+    println!("Estimated download time (if speed stays stable):");
+
+    for protocol in [Protocol::Http, Protocol::Ftp] {
+        let Some(probe) = successful.iter().find(|probe| probe.protocol == protocol) else {
+            continue;
+        };
+
+        let speed_mbps = probe.mbps;
+        let speed_mbs = speed_mbps / 8.0;
+        let estimate_50 = estimate_download_duration_for_gb(50, speed_mbps)
+            .map(format_duration_human)
+            .unwrap_or_else(|| "n/a".to_string());
+        let estimate_100 = estimate_download_duration_for_gb(100, speed_mbps)
+            .map(format_duration_human)
+            .unwrap_or_else(|| "n/a".to_string());
+
+        println!(
+            "- {} @ {:.2} Mbps ({:.2} MB/s): 50 GB ~ {}, 100 GB ~ {}",
+            protocol_name(protocol),
+            speed_mbps,
+            speed_mbs,
+            estimate_50,
+            estimate_100
+        );
+    }
+}
+
+fn estimate_download_duration_for_gb(size_gb: u64, mbps: f64) -> Option<Duration> {
+    if mbps <= 0.0 || !mbps.is_finite() {
+        return None;
+    }
+
+    let total_bits = size_gb as f64 * 1_000_000_000.0 * 8.0;
+    let bits_per_second = mbps * 1_000_000.0;
+    let seconds = total_bits / bits_per_second;
+
+    if seconds <= 0.0 || !seconds.is_finite() {
+        return None;
+    }
+
+    Some(Duration::from_secs_f64(seconds))
+}
+
+fn format_duration_human(duration: Duration) -> String {
+    let total_seconds = duration.as_secs().max(1);
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds % 86_400) / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.2} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn build_speed_test_url(base: &str, remote_path: &str, expected_protocol: Protocol) -> Result<Url> {
@@ -478,8 +558,11 @@ fn print_probe_line(label: &str, attempt: Option<&SpeedProbeAttempt>) {
             result: Some(result),
             ..
         }) => println!(
-            "- {label}: {:.2} Mbps sampled over {:.1}s ({} bytes)",
-            result.mbps, result.sample_seconds, result.sample_bytes
+            "- {label}: {:.2} Mbps ({:.2} MB/s), sampled {} over {:.1}s",
+            result.mbps,
+            result.mbps / 8.0,
+            format_bytes_human(result.sample_bytes),
+            result.sample_seconds
         ),
         Some(SpeedProbeAttempt {
             result: None,
@@ -607,5 +690,20 @@ mod tests {
             .expect_err("expected ftp scheme validation error");
 
         assert!(err.to_string().contains("FTP base URL must use ftp"));
+    }
+
+    #[test]
+    fn estimates_50gb_duration_at_100mbps() {
+        let estimate = estimate_download_duration_for_gb(50, 100.0)
+            .expect("expected a duration for positive speed");
+
+        assert_eq!(estimate.as_secs(), 4_000);
+    }
+
+    #[test]
+    fn formats_human_duration() {
+        let formatted = format_duration_human(Duration::from_secs(4_000));
+
+        assert_eq!(formatted, "1h 6m");
     }
 }

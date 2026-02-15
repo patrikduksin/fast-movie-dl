@@ -75,6 +75,7 @@ Notes for `speed-test`:
 - Shows a live spinner while probing each protocol.
 - Reuses URL credentials or saved macOS Keychain credentials by host when available.
 - If probe errors look auth-related, it prompts once for credentials and retries that protocol.
+- Prints estimated download times for 50 GB and 100 GB files based on measured throughput.
 
 Force FTP:
 
