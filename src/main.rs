@@ -82,13 +82,13 @@ fn run_download(args: DownloadArgs) -> Result<i32> {
 
     let store = MacKeychainStore;
 
-    let mut credentials = credentials_from_url(&selection.chosen.url);
-    let mut from_keychain = false;
-
-    if credentials.is_none() && !args.no_keychain {
-        credentials = store.get(&host)?;
-        from_keychain = credentials.is_some();
-    }
+    let inline_credentials = credentials_from_url(&selection.chosen.url);
+    let saved_credentials = if args.no_keychain {
+        None
+    } else {
+        store.get(&host)?
+    };
+    let (credentials, from_keychain) = select_credentials(inline_credentials, saved_credentials);
 
     let mut plan = build_transfer_plan(
         selection.chosen.url.clone(),
@@ -123,7 +123,16 @@ fn run_download(args: DownloadArgs) -> Result<i32> {
     }
 
     // Retry once on auth-related failures.
-    if looks_like_auth_error(&outcome.combined_log) {
+    let should_retry_auth = looks_like_auth_error(&outcome.combined_log)
+        || (plan.protocol() == Protocol::Ftp
+            && outcome.exit_code == Some(21)
+            && plan
+                .credentials
+                .as_ref()
+                .map(|creds| creds.password.is_empty())
+                .unwrap_or(true));
+
+    if should_retry_auth {
         if from_keychain {
             eprintln!("Stored credentials were rejected; please enter fresh credentials.");
         } else {
@@ -480,21 +489,28 @@ fn speed_test_credentials_for_candidate(
         .ok_or_else(|| AppError::MissingHost(url.to_string()))?;
     let saved = store.get(host)?;
 
-    Ok(match (inline, saved) {
+    Ok(select_credentials(inline, saved).0)
+}
+
+fn select_credentials(
+    inline: Option<Credentials>,
+    saved: Option<Credentials>,
+) -> (Option<Credentials>, bool) {
+    match (inline, saved) {
         (Some(inline_creds), Some(saved_creds)) => {
             if inline_creds.password.is_empty()
                 && (inline_creds.username.is_empty()
                     || inline_creds.username == saved_creds.username)
             {
-                Some(saved_creds)
+                (Some(saved_creds), true)
             } else {
-                Some(inline_creds)
+                (Some(inline_creds), false)
             }
         }
-        (Some(inline_creds), None) => Some(inline_creds),
-        (None, Some(saved_creds)) => Some(saved_creds),
-        (None, None) => None,
-    })
+        (Some(inline_creds), None) => (Some(inline_creds), false),
+        (None, Some(saved_creds)) => (Some(saved_creds), true),
+        (None, None) => (None, false),
+    }
 }
 
 fn candidate_with_credentials(
@@ -705,5 +721,42 @@ mod tests {
         let formatted = format_duration_human(Duration::from_secs(4_000));
 
         assert_eq!(formatted, "1h 6m");
+    }
+
+    #[test]
+    fn selects_saved_credentials_when_inline_password_missing() {
+        let inline = Some(Credentials {
+            username: "alice".to_string(),
+            password: "".to_string(),
+        });
+        let saved = Some(Credentials {
+            username: "alice".to_string(),
+            password: "secret".to_string(),
+        });
+
+        let (selected, from_keychain) = select_credentials(inline, saved);
+        let selected = selected.expect("expected selected credentials");
+
+        assert!(from_keychain);
+        assert_eq!(selected.username, "alice");
+        assert_eq!(selected.password, "secret");
+    }
+
+    #[test]
+    fn keeps_inline_credentials_when_password_present() {
+        let inline = Some(Credentials {
+            username: "alice".to_string(),
+            password: "inline-pass".to_string(),
+        });
+        let saved = Some(Credentials {
+            username: "alice".to_string(),
+            password: "saved-pass".to_string(),
+        });
+
+        let (selected, from_keychain) = select_credentials(inline, saved);
+        let selected = selected.expect("expected selected credentials");
+
+        assert!(!from_keychain);
+        assert_eq!(selected.password, "inline-pass");
     }
 }
