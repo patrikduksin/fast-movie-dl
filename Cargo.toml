@@ -1,0 +1,17 @@
+[package]
+name = "fast-movie-dl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+indicatif = "0.17"
+keyring = "2"
+thiserror = "1"
+url = "2"
+which = "6"
+
+[dev-dependencies]
+tempfile = "3"

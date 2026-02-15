@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lockfile policy:
+# Keep Cargo.lock for binaries/apps. Uncomment to ignore for libraries.
+# Cargo.lock
+
+# macOS
+.DS_Store
+
+# media files
+*.mkv
+*.mkv.aria2
+*.aria2
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
