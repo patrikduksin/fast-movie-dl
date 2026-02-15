@@ -14,6 +14,8 @@ pub struct Cli {
 pub enum Commands {
     /// Download a large file with speed-optimized settings
     Download(DownloadArgs),
+    /// Run an interactive HTTP vs FTP speed test
+    SpeedTest,
     /// Check local prerequisites
     Doctor,
     /// Manage saved credentials

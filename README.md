@@ -7,6 +7,7 @@ Speed-focused CLI for downloading huge movie files over HTTP/HTTPS/FTP using `ar
 - Uses `aria2c` with high-throughput defaults for large files (60-90GB and up).
 - Auto-resumes interrupted downloads.
 - Supports protocol auto mode with short throughput probing when both HTTP and FTP URLs are provided.
+- Includes an interactive manual speed test for HTTP vs FTP using the same remote file path.
 - Prompts for credentials on auth failures and stores them in macOS Keychain by host.
 
 ## Requirements
@@ -54,6 +55,26 @@ fast-movie-dl download "https://files.example.com/movie.mkv" \
   --ftp-url "ftp://files.example.com/movie.mkv" \
   --protocol auto
 ```
+
+Run an interactive manual speed test (base URLs + shared remote path):
+
+```bash
+fast-movie-dl speed-test
+```
+
+Prompt flow:
+
+```text
+HTTP base URL (e.g. https://files.example.com)
+FTP base URL (e.g. ftp://files.example.com)
+Remote path (e.g. movies/2026/sample.mkv)
+```
+
+Notes for `speed-test`:
+
+- Shows a live spinner while probing each protocol.
+- Reuses URL credentials or saved macOS Keychain credentials by host when available.
+- If probe errors look auth-related, it prompts once for credentials and retries that protocol.
 
 Force FTP:
 

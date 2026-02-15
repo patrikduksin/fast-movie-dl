@@ -90,7 +90,9 @@ pub fn prompt_credentials(default_username: Option<&str>) -> Result<Credentials>
         }
     }
 
-    let username = username_prompt.interact_text().context("username input failed")?;
+    let username = username_prompt
+        .interact_text()
+        .context("username input failed")?;
 
     let password = Password::new()
         .with_prompt("Password")

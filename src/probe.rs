@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -39,6 +40,13 @@ pub struct SpeedProbeResult {
     pub mbps: f64,
     pub sample_bytes: u64,
     pub sample_seconds: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeedProbeAttempt {
+    pub protocol: Protocol,
+    pub result: Option<SpeedProbeResult>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -164,7 +172,11 @@ pub fn select_candidate_with_probe(
     }
 
     let mut sorted = probes.clone();
-    sorted.sort_by(|a, b| b.mbps.partial_cmp(&a.mbps).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.mbps
+            .partial_cmp(&a.mbps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let winner = &sorted[0];
     let runner_up = sorted.get(1);
@@ -195,7 +207,11 @@ pub fn select_candidate_with_probe(
     let best_probe = probes
         .iter()
         .filter(|p| p.protocol == chosen.protocol)
-        .max_by(|a, b| a.mbps.partial_cmp(&b.mbps).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.mbps
+                .partial_cmp(&b.mbps)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .cloned();
 
     Ok(ProbeSelection {
@@ -206,13 +222,29 @@ pub fn select_candidate_with_probe(
     })
 }
 
-fn probe_candidate(aria2_path: &str, candidate: &UrlCandidate, sample_seconds: u64) -> Result<SpeedProbeResult> {
+pub fn probe_candidate_for_speed_test(
+    aria2_path: &str,
+    candidate: &UrlCandidate,
+    sample_seconds: u64,
+) -> Result<SpeedProbeResult> {
+    probe_candidate(aria2_path, candidate, sample_seconds)
+}
+
+fn probe_candidate(
+    aria2_path: &str,
+    candidate: &UrlCandidate,
+    sample_seconds: u64,
+) -> Result<SpeedProbeResult> {
     let temp_root = std::env::temp_dir();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis();
-    let dir = temp_root.join(format!("fast-movie-dl-probe-{}-{}", std::process::id(), stamp));
+    let dir = temp_root.join(format!(
+        "fast-movie-dl-probe-{}-{}",
+        std::process::id(),
+        stamp
+    ));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed creating probe directory {}", dir.display()))?;
 
@@ -237,25 +269,54 @@ fn probe_candidate(aria2_path: &str, candidate: &UrlCandidate, sample_seconds: u
         .arg(format!("--dir={}", dir.display()))
         .arg(format!("--out={out_name}"))
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     let mut child = command.spawn().context("failed to start aria2 probe")?;
 
     let started = Instant::now();
     thread::sleep(Duration::from_secs(sample_seconds));
 
-    match child.try_wait()? {
-        Some(_status) => {}
+    let mut killed_for_timeout = false;
+    let status = match child.try_wait()? {
+        Some(status) => status,
         None => {
+            killed_for_timeout = true;
             let _ = child.kill();
-            let _ = child.wait();
+            child
+                .wait()
+                .context("failed waiting for aria2 probe process")?
         }
-    }
+    };
+
+    let stderr_text = read_stderr(&mut child);
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     let sample_bytes = size_or_zero(&out_path);
 
     let _ = std::fs::remove_dir_all(&dir);
+
+    if !killed_for_timeout && !status.success() {
+        let exit = status.code();
+        let exit_text = match exit {
+            Some(code) => {
+                if let Some(description) = aria2_exit_description(code) {
+                    format!("{code}: {description}")
+                } else {
+                    code.to_string()
+                }
+            }
+            None => "terminated by signal".to_string(),
+        };
+        let details = summarize_probe_error(&stderr_text);
+        return Err(anyhow!(
+            "aria2 probe failed (exit code {exit_text}): {details}"
+        ));
+    }
+
+    if sample_bytes == 0 {
+        let details = summarize_probe_error(&stderr_text);
+        return Err(anyhow!("no sample bytes downloaded: {details}"));
+    }
 
     Ok(SpeedProbeResult {
         protocol: candidate.protocol,
@@ -267,6 +328,36 @@ fn probe_candidate(aria2_path: &str, candidate: &UrlCandidate, sample_seconds: u
 
 fn size_or_zero(path: &PathBuf) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn read_stderr(child: &mut std::process::Child) -> String {
+    let mut stderr_text = String::new();
+
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_text);
+    }
+
+    stderr_text
+}
+
+fn summarize_probe_error(stderr_text: &str) -> String {
+    let summary = stderr_text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no additional details from aria2");
+
+    summary.chars().take(220).collect()
+}
+
+fn aria2_exit_description(code: i32) -> Option<&'static str> {
+    match code {
+        3 => Some("resource not found"),
+        21 => Some("FTP command failed"),
+        24 => Some("HTTP authorization failed"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

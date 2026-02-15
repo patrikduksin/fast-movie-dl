@@ -14,11 +14,20 @@ pub struct RunOutcome {
 
 pub fn execute_aria2(aria2_path: &str, args: &[String]) -> Result<RunOutcome> {
     let mut command = Command::new(aria2_path);
-    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = command.spawn().context("failed to start aria2c")?;
-    let stdout = child.stdout.take().context("failed to capture aria2 stdout")?;
-    let stderr = child.stderr.take().context("failed to capture aria2 stderr")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture aria2 stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture aria2 stderr")?;
 
     let (tx, rx) = mpsc::channel::<(bool, String)>();
 
