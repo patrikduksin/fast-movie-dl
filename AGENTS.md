@@ -26,6 +26,16 @@ If they are added later, treat them as mandatory and fold them into this file.
 
 ## Build, lint, test commands
 
+### Shell environment note
+- Command runners may execute in non-interactive Bash by default.
+- In this repository, Rust tooling (`cargo`) is available in Fish but may be missing in Bash `PATH`.
+- When required tooling is unavailable in Bash, prefer running commands through Fish first, then Zsh as fallback.
+- Example wrappers:
+```bash
+fish -c 'cargo test'
+zsh -lc 'cargo test'
+```
+
 ### Setup / environment
 ```bash
 rustup show
