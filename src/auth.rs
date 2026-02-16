@@ -73,13 +73,10 @@ impl CredentialStore for MacKeychainStore {
         let credentials_entry = Entry::new(SERVICE, &Self::credentials_key(host))
             .context("failed to create keychain credentials entry")?;
 
-        match credentials_entry.get_password() {
-            Ok(raw) => {
-                if let Some(creds) = decode_credentials_blob(&raw) {
-                    return Ok(Some(creds));
-                }
+        if let Ok(raw) = credentials_entry.get_password() {
+            if let Some(creds) = decode_credentials_blob(&raw) {
+                return Ok(Some(creds));
             }
-            Err(_) => {}
         }
 
         self.read_legacy_credentials(host)

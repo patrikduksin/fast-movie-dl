@@ -12,6 +12,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Launch terminal UI
+    Tui,
     /// Download a large file with speed-optimized settings
     Download(DownloadArgs),
     /// Run an interactive HTTP vs FTP speed test

@@ -7,6 +7,7 @@ Speed-focused CLI for downloading huge movie files over HTTP/HTTPS/FTP using `ar
 - Uses `aria2c` with high-throughput defaults for large files (60-90GB and up).
 - Auto-resumes interrupted downloads.
 - Supports protocol auto mode with short throughput probing when both HTTP and FTP URLs are provided.
+- In auto mode, defaults to FTP when probe results are unavailable or too close to call.
 - Includes an interactive manual speed test for HTTP vs FTP using the same remote file path.
 - Prompts for credentials on auth failures and stores them in macOS Keychain by host.
 
@@ -47,6 +48,31 @@ Basic download:
 ```bash
 fast-movie-dl download "https://files.example.com/movie.mkv"
 ```
+
+Launch the terminal UI:
+
+```bash
+fast-movie-dl tui
+```
+
+TUI workflow:
+
+- Save reusable machine profiles (HTTP base URL, FTP base URL, default output directory).
+- Pick a profile and browse remote FTP directories.
+- Select a file to auto-probe HTTP vs FTP and start download.
+- Watch live aria2 logs in the running screen; full session log is also saved to a temp file.
+- Review result and log tail in the same UI.
+
+TUI keyboard shortcuts:
+
+- Profile screen: `Enter` open browser, `n` new profile, `d` delete profile, `q` quit.
+- Browser screen: `j`/`k` move, `Enter` open dir or download file, `h`/`Backspace` parent dir, `r` refresh, `e` edit fields, `q` back.
+- Form screen (vim-like):
+  - `i` enters INSERT mode, `Esc` returns to NORMAL mode.
+  - NORMAL mode: `h`/`k` previous field, `j`/`l` next field, `w` save profile, `b` browse remote directory, `r` run download, `q` back.
+  - INSERT mode: type to edit, `Backspace` delete, `Tab` move field.
+  - Legacy keys still work: `Ctrl+S`/`F2` save, `F5` run.
+- Result screen: `r` retry, `e` edit inputs, `p` profiles, `q` quit.
 
 Compare HTTP vs FTP before full download:
 

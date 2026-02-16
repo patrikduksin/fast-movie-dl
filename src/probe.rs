@@ -157,17 +157,17 @@ pub fn select_candidate_with_probe(
     }
 
     if probes.is_empty() {
-        // Could not obtain sample data. Prefer HTTP when available.
+        // Could not obtain sample data. Prefer FTP when available.
         let chosen = candidates
             .iter()
-            .find(|c| c.protocol == Protocol::Http)
+            .find(|c| c.protocol == Protocol::Ftp)
             .unwrap_or(&candidates[0])
             .clone();
         return Ok(ProbeSelection {
             chosen,
             best_probe: None,
             all_probes: probes,
-            reason: "speed probe unavailable; defaulting to HTTP when possible".to_string(),
+            reason: "speed probe unavailable; defaulting to FTP when possible".to_string(),
         });
     }
 
@@ -182,7 +182,7 @@ pub fn select_candidate_with_probe(
     let runner_up = sorted.get(1);
 
     let chosen_protocol = if let Some(second) = runner_up {
-        // Require a clear lead to switch away from HTTP if close.
+        // Require a clear lead to switch away from FTP if close.
         let lead_ratio = if second.mbps > 0.0 {
             (winner.mbps - second.mbps) / second.mbps
         } else {
@@ -190,7 +190,7 @@ pub fn select_candidate_with_probe(
         };
 
         if lead_ratio < 0.10 {
-            Protocol::Http
+            Protocol::Ftp
         } else {
             winner.protocol
         }

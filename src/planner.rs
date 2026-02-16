@@ -158,7 +158,7 @@ fn ensure_directory(path: &Path) -> Result<()> {
 
 fn file_name_from_url(url: &Url) -> Option<String> {
     url.path_segments()
-        .and_then(|segments| segments.filter(|s| !s.is_empty()).last())
+        .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
         .map(str::to_string)
 }
 

@@ -5,6 +5,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 
+type LineSink<'a> = &'a mut dyn FnMut(bool, &str);
+
 #[derive(Debug)]
 pub struct RunOutcome {
     pub success: bool,
@@ -13,6 +15,26 @@ pub struct RunOutcome {
 }
 
 pub fn execute_aria2(aria2_path: &str, args: &[String]) -> Result<RunOutcome> {
+    execute_aria2_inner(aria2_path, args, true, None)
+}
+
+pub fn execute_aria2_capture_with_sink<F>(
+    aria2_path: &str,
+    args: &[String],
+    mut on_line: F,
+) -> Result<RunOutcome>
+where
+    F: FnMut(bool, &str),
+{
+    execute_aria2_inner(aria2_path, args, false, Some(&mut on_line))
+}
+
+fn execute_aria2_inner(
+    aria2_path: &str,
+    args: &[String],
+    stream_output: bool,
+    mut on_line: Option<LineSink<'_>>,
+) -> Result<RunOutcome> {
     let mut command = Command::new(aria2_path);
     command
         .args(args)
@@ -39,10 +61,16 @@ pub fn execute_aria2(aria2_path: &str, args: &[String]) -> Result<RunOutcome> {
     let mut log = String::new();
     const LOG_LIMIT: usize = 128 * 1024;
     for (is_stderr, line) in rx {
-        if is_stderr {
-            let _ = writeln!(std::io::stderr(), "{}", line);
-        } else {
-            let _ = writeln!(std::io::stdout(), "{}", line);
+        if stream_output {
+            if is_stderr {
+                let _ = writeln!(std::io::stderr(), "{}", line);
+            } else {
+                let _ = writeln!(std::io::stdout(), "{}", line);
+            }
+        }
+
+        if let Some(sink) = on_line.as_mut() {
+            sink(is_stderr, &line);
         }
 
         append_bounded(&mut log, &line, LOG_LIMIT);

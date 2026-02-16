@@ -1,10 +1,13 @@
 mod auth;
 mod cli;
+mod config;
 mod doctor;
 mod errors;
 mod planner;
 mod probe;
+mod remote;
 mod runner;
+mod tui;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -23,11 +26,13 @@ use crate::probe::{
     SpeedProbeAttempt, SpeedProbeResult, UrlCandidate,
 };
 use crate::runner::{execute_aria2, looks_like_auth_error};
+use crate::tui::run_tui;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let code = match cli.command {
+        Commands::Tui => run_tui()?,
         Commands::Doctor => run_doctor()?,
         Commands::Auth { command } => run_auth(command)?,
         Commands::Download(args) => run_download(args)?,
