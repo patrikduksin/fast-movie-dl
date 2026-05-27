@@ -66,7 +66,8 @@ TUI workflow:
 TUI keyboard shortcuts:
 
 - Profile screen: `Enter` open browser, `n` new profile, `d` delete profile, `q` quit.
-- Browser screen: `j`/`k` move, `Enter` open dir or download file, `h`/`Backspace` parent dir (up to one level above the FTP base URL path), `r` refresh, `e` edit fields, `q` back.
+- Browser screen: `j`/`k` move, `Enter` open dir or download file, `x`/`Delete` delete selected remote file or directory, `h`/`Backspace` parent dir (up to one level above the FTP base URL path), `r` refresh, `e` edit fields, `q` back.
+- Delete confirmation screen: `y`/`Enter` confirm, `n`/`Esc` cancel. Directory deletion is recursive.
 - Form screen (vim-like):
   - `i` enters INSERT mode, `Esc` returns to NORMAL mode.
   - NORMAL mode: `h`/`k` previous field, `j`/`l` next field, `w` save profile, `b` browse remote directory, `r` run download, `q` back.

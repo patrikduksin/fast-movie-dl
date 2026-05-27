@@ -28,8 +28,8 @@ use crate::probe::{
     resolve_candidates, select_candidate_with_probe, Protocol, SpeedProbeResult, UrlCandidate,
 };
 use crate::remote::{
-    combine_base_and_relative_path, join_remote_path, list_ftp_directory, normalize_remote_path,
-    parent_remote_path, RemoteEntry, RemoteListing,
+    combine_base_and_relative_path, delete_ftp_path, join_remote_path, list_ftp_directory,
+    normalize_remote_path, parent_remote_path, RemoteDeleteSummary, RemoteEntry, RemoteListing,
 };
 use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunOutcome};
 
@@ -37,6 +37,7 @@ use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunO
 enum Screen {
     Profiles,
     Browser,
+    DeleteConfirm,
     Form,
     Running,
     Result,
@@ -268,6 +269,21 @@ struct BrowserListSummary {
     listing: RemoteListing,
 }
 
+#[derive(Debug, Clone)]
+struct BrowserDeleteTarget {
+    remote_path: String,
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserDeleteRequest {
+    ftp_base_url: String,
+    remote_path: String,
+    credentials: Option<Credentials>,
+    recursive: bool,
+}
+
 struct TuiApp {
     config: AppConfig,
     screen: Screen,
@@ -281,6 +297,8 @@ struct TuiApp {
     browser_entries: Vec<RemoteEntry>,
     browser_error: Option<String>,
     listing_worker: Option<Receiver<Result<BrowserListSummary>>>,
+    delete_worker: Option<Receiver<Result<RemoteDeleteSummary>>>,
+    pending_delete: Option<BrowserDeleteTarget>,
     status: Option<String>,
     worker: Option<Receiver<DownloadWorkerEvent>>,
     running_log_lines: Vec<String>,
@@ -306,6 +324,8 @@ impl TuiApp {
             browser_entries: Vec::new(),
             browser_error: None,
             listing_worker: None,
+            delete_worker: None,
+            pending_delete: None,
             status: None,
             worker: None,
             running_log_lines: Vec::new(),
@@ -323,6 +343,7 @@ impl TuiApp {
 
     fn poll_worker(&mut self) {
         self.poll_listing_worker();
+        self.poll_delete_worker();
         self.poll_download_worker();
     }
 
@@ -397,6 +418,35 @@ impl TuiApp {
                 self.browser_selected = 0;
                 self.browser_error = Some("directory listing worker disconnected".to_string());
                 self.status = Some("Directory listing failed".to_string());
+            }
+        }
+    }
+
+    fn poll_delete_worker(&mut self) {
+        let Some(worker) = &self.delete_worker else {
+            return;
+        };
+
+        match worker.try_recv() {
+            Ok(result) => {
+                self.delete_worker = None;
+                match result {
+                    Ok(summary) => {
+                        self.status = Some(format!(
+                            "Deleted {} ({} file(s), {} directories)",
+                            summary.target_path, summary.deleted_files, summary.deleted_directories
+                        ));
+                        self.reload_browser_listing();
+                    }
+                    Err(err) => {
+                        self.status = Some(format!("Delete failed: {err}"));
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.delete_worker = None;
+                self.status = Some("Delete worker unexpectedly disconnected".to_string());
             }
         }
     }
@@ -613,6 +663,7 @@ impl TuiApp {
         match self.screen {
             Screen::Profiles => self.handle_profiles_key(key),
             Screen::Browser => self.handle_browser_key(key),
+            Screen::DeleteConfirm => self.handle_delete_confirm_key(key),
             Screen::Form => self.handle_form_key(key),
             Screen::Running => self.handle_running_key(key),
             Screen::Result => self.handle_result_key(key),
@@ -676,6 +727,7 @@ impl TuiApp {
                 }
             }
             KeyCode::Char('r') => self.reload_browser_listing(),
+            KeyCode::Delete | KeyCode::Char('x') => self.confirm_delete_selected_browser_entry(),
             KeyCode::Char('e') => {
                 self.screen = Screen::Form;
                 self.input_mode = InputMode::Normal;
@@ -709,6 +761,71 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    fn confirm_delete_selected_browser_entry(&mut self) {
+        if self.listing_worker.is_some() || self.delete_worker.is_some() {
+            return;
+        }
+
+        let Some(selected) = self.browser_entries.get(self.browser_selected).cloned() else {
+            self.status = Some("No remote entry selected".to_string());
+            return;
+        };
+
+        let remote_path = join_remote_path(&self.browser_current_dir, &selected.name);
+        self.pending_delete = Some(BrowserDeleteTarget {
+            remote_path,
+            name: selected.name,
+            is_dir: selected.is_dir,
+        });
+        self.screen = Screen::DeleteConfirm;
+        self.status = Some("Confirm remote delete".to_string());
+    }
+
+    fn handle_delete_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => self.start_delete_pending_entry(),
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
+                self.pending_delete = None;
+                self.screen = Screen::Browser;
+                self.status = Some("Delete cancelled".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn start_delete_pending_entry(&mut self) {
+        if self.delete_worker.is_some() {
+            return;
+        }
+
+        let Some(target) = self.pending_delete.take() else {
+            self.screen = Screen::Browser;
+            self.status = Some("No remote entry selected".to_string());
+            return;
+        };
+
+        let request = BrowserDeleteRequest {
+            ftp_base_url: self.form.ftp_base_url.clone(),
+            remote_path: target.remote_path.clone(),
+            credentials: form_credentials(&self.form),
+            recursive: target.is_dir,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.delete_worker = Some(rx);
+        self.screen = Screen::Browser;
+        self.status = Some(format!(
+            "Deleting {} {}...",
+            if target.is_dir { "directory" } else { "file" },
+            target.remote_path
+        ));
+
+        thread::spawn(move || {
+            let result = run_browser_delete_job(request);
+            let _ = tx.send(result);
+        });
     }
 
     fn handle_form_key(&mut self, key: KeyEvent) {
@@ -848,6 +965,7 @@ impl TuiApp {
         match self.screen {
             Screen::Profiles => self.render_profiles(frame),
             Screen::Browser => self.render_browser(frame),
+            Screen::DeleteConfirm => self.render_delete_confirm(frame),
             Screen::Form => self.render_form(frame),
             Screen::Running => self.render_running(frame),
             Screen::Result => self.render_result(frame),
@@ -931,6 +1049,8 @@ impl TuiApp {
                 "Loading {}...",
                 display_remote_dir(&self.browser_current_dir)
             )
+        } else if self.delete_worker.is_some() {
+            "Deleting remote entry...".to_string()
         } else if let Some(error) = &self.browser_error {
             format!("Error: {error}")
         } else {
@@ -984,12 +1104,52 @@ impl TuiApp {
 
         let footer = Paragraph::new(
             self.status.as_deref().unwrap_or(
-                "j/k move, Enter open dir or download file, h/backspace parent, r refresh, e edit, q back.",
+                "j/k move, Enter open dir or download file, x/Delete delete, h/backspace parent, r refresh, e edit, q back.",
             ),
         )
         .block(Block::default().borders(Borders::ALL).title("Help"))
         .wrap(Wrap { trim: true });
         frame.render_widget(footer, chunks[3]);
+    }
+
+    fn render_delete_confirm(&self, frame: &mut ratatui::Frame<'_>) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(6),
+                Constraint::Length(3),
+            ])
+            .split(frame.area());
+
+        let title = Paragraph::new("Confirm remote delete")
+            .block(Block::default().borders(Borders::ALL).title("Delete"));
+        frame.render_widget(title, chunks[0]);
+
+        let body_text = if let Some(target) = &self.pending_delete {
+            let kind = if target.is_dir { "directory" } else { "file" };
+            let recursive_note = if target.is_dir {
+                "\nDirectory deletion is recursive and will remove all contents."
+            } else {
+                ""
+            };
+            format!(
+                "Delete remote {kind}?\n\nName: {}\nPath: /{}{}",
+                target.name, target.remote_path, recursive_note
+            )
+        } else {
+            "No remote entry selected.".to_string()
+        };
+
+        let body = Paragraph::new(body_text)
+            .block(Block::default().borders(Borders::ALL).title("Target"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(body, chunks[1]);
+
+        let footer = Paragraph::new("y/Enter confirm, n/Esc cancel")
+            .block(Block::default().borders(Borders::ALL).title("Help"))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(footer, chunks[2]);
     }
 
     fn render_form(&self, frame: &mut ratatui::Frame<'_>) {
@@ -1301,6 +1461,16 @@ fn run_browser_list_job(request: BrowserListRequest) -> Result<BrowserListSummar
     )?;
 
     Ok(BrowserListSummary { listing })
+}
+
+fn run_browser_delete_job(request: BrowserDeleteRequest) -> Result<RemoteDeleteSummary> {
+    let target_url = build_remote_url(&request.ftp_base_url, &request.remote_path, Protocol::Ftp)?;
+
+    delete_ftp_path(
+        target_url.as_str(),
+        request.credentials.as_ref(),
+        request.recursive,
+    )
 }
 
 fn run_download_job(
