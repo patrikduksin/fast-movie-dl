@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
 use url::Url;
 
@@ -29,7 +29,8 @@ use crate::probe::{
 };
 use crate::remote::{
     combine_base_and_relative_path, delete_ftp_path, join_remote_path, list_ftp_directory,
-    normalize_remote_path, parent_remote_path, RemoteDeleteSummary, RemoteEntry, RemoteListing,
+    normalize_remote_path, parent_remote_path, upload_ftp_file, RemoteDeleteSummary, RemoteEntry,
+    RemoteListing,
 };
 use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunOutcome};
 
@@ -49,6 +50,7 @@ enum FormField {
     HttpBaseUrl,
     FtpBaseUrl,
     RemotePath,
+    LocalUploadPath,
     OutputDir,
     Filename,
     Username,
@@ -78,6 +80,7 @@ impl FormField {
             FormField::HttpBaseUrl,
             FormField::FtpBaseUrl,
             FormField::RemotePath,
+            FormField::LocalUploadPath,
             FormField::OutputDir,
             FormField::Filename,
             FormField::Username,
@@ -105,6 +108,7 @@ struct FormState {
     http_base_url: String,
     ftp_base_url: String,
     remote_path: String,
+    local_upload_path: String,
     output_dir: String,
     filename: String,
     username: String,
@@ -125,6 +129,7 @@ impl FormState {
                 http_base_url: item.http_base_url.clone(),
                 ftp_base_url: item.ftp_base_url.clone(),
                 remote_path: String::new(),
+                local_upload_path: String::new(),
                 output_dir: item
                     .output_dir
                     .as_ref()
@@ -140,6 +145,7 @@ impl FormState {
                 http_base_url: String::new(),
                 ftp_base_url: String::new(),
                 remote_path: String::new(),
+                local_upload_path: String::new(),
                 output_dir: cwd,
                 filename: String::new(),
                 username: String::new(),
@@ -225,6 +231,48 @@ impl FormState {
             remember_keychain: self.remember_keychain,
         })
     }
+
+    fn upload_input(&self, fallback_remote_dir: &str) -> Result<UploadInput> {
+        let ftp_base_url = self.ftp_base_url.trim();
+        let _ = parse_base_url(ftp_base_url, Protocol::Ftp)?;
+
+        let local_path = self.local_upload_path.trim();
+        if local_path.is_empty() {
+            bail!("local upload file cannot be empty");
+        }
+
+        let local_path = PathBuf::from(local_path);
+        if !local_path.is_file() {
+            bail!("local upload path is not a file: {}", local_path.display());
+        }
+        let local_filename = local_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("local upload path must include a file name"))?;
+
+        let remote_path = if self.remote_path.trim().is_empty() {
+            join_remote_path(fallback_remote_dir, local_filename)
+        } else {
+            self.remote_path.trim().to_string()
+        };
+
+        let credentials = if self.username.trim().is_empty() {
+            None
+        } else {
+            Some(Credentials {
+                username: self.username.trim().to_string(),
+                password: self.password.clone(),
+            })
+        };
+
+        Ok(UploadInput {
+            ftp_base_url: ftp_base_url.to_string(),
+            remote_path,
+            local_path,
+            credentials,
+            remember_keychain: self.remember_keychain,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,8 +286,24 @@ struct DownloadInput {
     remember_keychain: bool,
 }
 
+#[derive(Debug, Clone)]
+struct UploadInput {
+    ftp_base_url: String,
+    remote_path: String,
+    local_path: PathBuf,
+    credentials: Option<Credentials>,
+    remember_keychain: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TransferKind {
+    Download,
+    Upload,
+}
+
 #[derive(Debug)]
-struct DownloadSummary {
+struct TransferSummary {
+    kind: TransferKind,
     reason: String,
     chosen_url: String,
     output_path: String,
@@ -252,9 +316,10 @@ struct DownloadSummary {
 #[derive(Debug)]
 enum DownloadWorkerEvent {
     Status(String),
+    Progress { sent: u64, total: u64 },
     LogPath(String),
     LogLine(String),
-    Finished(Result<DownloadSummary>),
+    Finished(Result<TransferSummary>),
 }
 
 #[derive(Debug, Clone)]
@@ -303,8 +368,10 @@ struct TuiApp {
     worker: Option<Receiver<DownloadWorkerEvent>>,
     running_log_lines: Vec<String>,
     running_log_path: Option<String>,
+    running_progress: Option<(u64, u64)>,
+    running_kind: TransferKind,
     tick_count: usize,
-    result: Option<DownloadSummary>,
+    result: Option<TransferSummary>,
     result_error: Option<String>,
     should_quit: bool,
 }
@@ -330,6 +397,8 @@ impl TuiApp {
             worker: None,
             running_log_lines: Vec::new(),
             running_log_path: None,
+            running_progress: None,
+            running_kind: TransferKind::Download,
             tick_count: 0,
             result: None,
             result_error: None,
@@ -460,6 +529,9 @@ impl TuiApp {
                 Ok(DownloadWorkerEvent::Status(message)) => {
                     self.status = Some(message);
                 }
+                Ok(DownloadWorkerEvent::Progress { sent, total }) => {
+                    self.running_progress = Some((sent, total));
+                }
                 Ok(DownloadWorkerEvent::LogPath(path)) => {
                     self.running_log_path = Some(path);
                 }
@@ -492,7 +564,7 @@ impl TuiApp {
                     clear_worker = true;
                     self.result = None;
                     self.result_error =
-                        Some("download worker unexpectedly disconnected".to_string());
+                        Some("transfer worker unexpectedly disconnected".to_string());
                     self.screen = Screen::Result;
                     break;
                 }
@@ -647,10 +719,42 @@ impl TuiApp {
         self.result_error = None;
         self.running_log_lines.clear();
         self.running_log_path = None;
+        self.running_progress = None;
+        self.running_kind = TransferKind::Download;
         self.status = Some("Download started".to_string());
 
         thread::spawn(move || {
             let result = run_download_job(input, &tx);
+            let _ = tx.send(DownloadWorkerEvent::Finished(result));
+        });
+    }
+
+    fn start_upload(&mut self) {
+        if self.worker.is_some() {
+            return;
+        }
+
+        let input = match self.form.upload_input(&self.browser_current_dir) {
+            Ok(input) => input,
+            Err(err) => {
+                self.status = Some(format!("Invalid upload input: {err}"));
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.worker = Some(rx);
+        self.screen = Screen::Running;
+        self.result = None;
+        self.result_error = None;
+        self.running_log_lines.clear();
+        self.running_log_path = None;
+        self.running_progress = None;
+        self.running_kind = TransferKind::Upload;
+        self.status = Some("Upload started".to_string());
+
+        thread::spawn(move || {
+            let result = run_upload_job(input, &tx);
             let _ = tx.send(DownloadWorkerEvent::Finished(result));
         });
     }
@@ -727,6 +831,7 @@ impl TuiApp {
                 }
             }
             KeyCode::Char('r') => self.reload_browser_listing(),
+            KeyCode::Char('u') => self.start_upload(),
             KeyCode::Delete | KeyCode::Char('x') => self.confirm_delete_selected_browser_entry(),
             KeyCode::Char('e') => {
                 self.screen = Screen::Form;
@@ -859,6 +964,7 @@ impl TuiApp {
             }
             KeyCode::F(2) | KeyCode::Char('w') => self.save_profile(),
             KeyCode::F(5) | KeyCode::Char('r') => self.start_download(),
+            KeyCode::Char('u') => self.start_upload(),
             KeyCode::Char('b') => {
                 self.screen = Screen::Browser;
                 self.input_mode = InputMode::Normal;
@@ -933,7 +1039,7 @@ impl TuiApp {
 
     fn handle_running_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-            self.status = Some("Download is running. Wait for completion.".to_string());
+            self.status = Some("Transfer is running. Wait for completion.".to_string());
         }
     }
 
@@ -942,7 +1048,10 @@ impl TuiApp {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('p') => self.screen = Screen::Profiles,
             KeyCode::Char('e') | KeyCode::Enter => self.screen = Screen::Form,
-            KeyCode::Char('r') => self.start_download(),
+            KeyCode::Char('r') => match self.result.as_ref().map(|summary| summary.kind) {
+                Some(TransferKind::Upload) => self.start_upload(),
+                _ => self.start_download(),
+            },
             _ => {}
         }
     }
@@ -953,6 +1062,7 @@ impl TuiApp {
             FormField::HttpBaseUrl => Some(&mut self.form.http_base_url),
             FormField::FtpBaseUrl => Some(&mut self.form.ftp_base_url),
             FormField::RemotePath => Some(&mut self.form.remote_path),
+            FormField::LocalUploadPath => Some(&mut self.form.local_upload_path),
             FormField::OutputDir => Some(&mut self.form.output_dir),
             FormField::Filename => Some(&mut self.form.filename),
             FormField::Username => Some(&mut self.form.username),
@@ -1104,7 +1214,7 @@ impl TuiApp {
 
         let footer = Paragraph::new(
             self.status.as_deref().unwrap_or(
-                "j/k move, Enter open dir or download file, x/Delete delete, h/backspace parent, r refresh, e edit, q back.",
+                "j/k move, Enter open dir or download file, u upload local file here, x/Delete delete, h/backspace parent, r refresh, e edit, q back.",
             ),
         )
         .block(Block::default().borders(Borders::ALL).title("Help"))
@@ -1162,10 +1272,10 @@ impl TuiApp {
             ])
             .split(frame.area());
 
-        let title = Paragraph::new("Edit machine settings and start download").block(
+        let title = Paragraph::new("Edit machine settings and start transfers").block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("Download Setup [{}]", self.input_mode.label())),
+                .title(format!("Transfer Setup [{}]", self.input_mode.label())),
         );
         frame.render_widget(title, chunks[0]);
 
@@ -1201,6 +1311,11 @@ impl TuiApp {
                 FormField::RemotePath,
                 "Remote path",
                 self.form.remote_path.as_str(),
+            ),
+            (
+                FormField::LocalUploadPath,
+                "Upload local file",
+                self.form.local_upload_path.as_str(),
             ),
             (
                 FormField::OutputDir,
@@ -1248,7 +1363,7 @@ impl TuiApp {
 
         let status_line = self.status.as_deref().unwrap_or(match self.input_mode {
             InputMode::Normal => {
-                "NORMAL: i insert, hjkl move fields, w save, b browse, r run, q back, Enter toggles checkbox/edits field."
+                "NORMAL: i insert, hjkl move fields, w save, b browse, r download, u upload, q back, Enter toggles checkbox/edits field."
             }
             InputMode::Insert => {
                 "INSERT: type to edit, Backspace delete, Tab move field, Esc to NORMAL."
@@ -1266,6 +1381,7 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Length(5),
+                Constraint::Length(3),
                 Constraint::Min(8),
                 Constraint::Length(3),
             ])
@@ -1275,22 +1391,68 @@ impl TuiApp {
         let spinner = spinner_frames[self.tick_count % spinner_frames.len()];
         let phase = self.status.as_deref().unwrap_or("Working...");
 
-        let title = Paragraph::new("Download in progress")
+        let transfer_label = match self.running_kind {
+            TransferKind::Download => "Download",
+            TransferKind::Upload => "Upload",
+        };
+
+        let title = Paragraph::new(format!("{transfer_label} in progress"))
             .block(Block::default().borders(Borders::ALL).title("Running"));
         frame.render_widget(title, chunks[0]);
 
-        let body = Paragraph::new(format!(
-            "{spinner} {phase}\nRemote path: {}\nOutput dir: {}",
-            self.form.remote_path,
-            if self.form.output_dir.trim().is_empty() {
-                "(current directory)"
-            } else {
-                self.form.output_dir.trim()
-            }
-        ))
-        .block(Block::default().borders(Borders::ALL).title("Status"))
-        .wrap(Wrap { trim: true });
+        let target_line = match self.running_kind {
+            TransferKind::Download => format!(
+                "Remote path: {}\nOutput dir: {}",
+                self.form.remote_path,
+                if self.form.output_dir.trim().is_empty() {
+                    "(current directory)"
+                } else {
+                    self.form.output_dir.trim()
+                }
+            ),
+            TransferKind::Upload => format!(
+                "Local file: {}\nRemote dir/path: {}",
+                if self.form.local_upload_path.trim().is_empty() {
+                    "(not set)"
+                } else {
+                    self.form.local_upload_path.trim()
+                },
+                if self.form.remote_path.trim().is_empty() {
+                    display_remote_dir(&self.browser_current_dir)
+                } else {
+                    self.form.remote_path.trim().to_string()
+                }
+            ),
+        };
+
+        let body = Paragraph::new(format!("{spinner} {phase}\n{target_line}"))
+            .block(Block::default().borders(Borders::ALL).title("Status"))
+            .wrap(Wrap { trim: true });
         frame.render_widget(body, chunks[1]);
+
+        let gauge = if let Some((sent, total)) = self.running_progress {
+            let ratio = if total == 0 {
+                1.0
+            } else {
+                (sent as f64 / total as f64).clamp(0.0, 1.0)
+            };
+            Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title("Progress"))
+                .gauge_style(Style::default().fg(Color::Cyan))
+                .ratio(ratio)
+                .label(format!(
+                    "{} / {}",
+                    format_bytes_human(sent),
+                    format_bytes_human(total)
+                ))
+        } else {
+            Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title("Progress"))
+                .gauge_style(Style::default().fg(Color::Yellow))
+                .ratio(0.0)
+                .label("waiting for byte progress")
+        };
+        frame.render_widget(gauge, chunks[2]);
 
         let log_lines: Vec<Line<'_>> = if self.running_log_lines.is_empty() {
             vec![Line::from("(waiting for aria2 output)")]
@@ -1304,17 +1466,17 @@ impl TuiApp {
         let logs = Paragraph::new(log_lines)
             .block(Block::default().borders(Borders::ALL).title("Live Logs"))
             .wrap(Wrap { trim: false });
-        frame.render_widget(logs, chunks[2]);
+        frame.render_widget(logs, chunks[3]);
 
         let footer_text = if let Some(path) = &self.running_log_path {
             format!("Live log file: {path}")
         } else {
-            "Please wait. Quitting is disabled while the download job runs.".to_string()
+            "Please wait. Quitting is disabled while the transfer job runs.".to_string()
         };
 
         let footer =
             Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL).title("Info"));
-        frame.render_widget(footer, chunks[3]);
+        frame.render_widget(footer, chunks[4]);
     }
 
     fn render_result(&self, frame: &mut ratatui::Frame<'_>) {
@@ -1330,12 +1492,18 @@ impl TuiApp {
 
         let (title_text, color) = if let Some(summary) = &self.result {
             if summary.outcome.success {
-                ("Download finished successfully", Color::Green)
+                match summary.kind {
+                    TransferKind::Download => ("Download finished successfully", Color::Green),
+                    TransferKind::Upload => ("Upload finished successfully", Color::Green),
+                }
             } else {
-                ("Download failed", Color::Red)
+                match summary.kind {
+                    TransferKind::Download => ("Download failed", Color::Red),
+                    TransferKind::Upload => ("Upload failed", Color::Red),
+                }
             }
         } else {
-            ("Download failed", Color::Red)
+            ("Transfer failed", Color::Red)
         };
 
         let title = Paragraph::new(Line::from(Span::styled(
@@ -1347,13 +1515,16 @@ impl TuiApp {
 
         let details_lines = if let Some(summary) = &self.result {
             let mut lines = vec![
-                Line::from(format!("Selection reason: {}", summary.reason)),
-                Line::from(format!("Chosen URL: {}", summary.chosen_url)),
-                Line::from(format!("Output path: {}", summary.output_path)),
+                Line::from(format!("Transfer: {}", transfer_kind_label(summary.kind))),
+                Line::from(format!("Plan: {}", summary.reason)),
+                Line::from(format!("Source/URL: {}", summary.chosen_url)),
+                Line::from(format!("Target: {}", summary.output_path)),
                 Line::from(format!("Saved log: {}", summary.log_path)),
             ];
 
-            if summary.probes.is_empty() {
+            if summary.kind == TransferKind::Upload {
+                lines.push(Line::from("Probe results: not used for FTP upload"));
+            } else if summary.probes.is_empty() {
                 lines.push(Line::from("Probe results: unavailable"));
             } else {
                 for probe in &summary.probes {
@@ -1378,7 +1549,7 @@ impl TuiApp {
             vec![Line::from(
                 self.result_error
                     .as_deref()
-                    .unwrap_or("unknown error while running download"),
+                    .unwrap_or("unknown error while running transfer"),
             )]
         };
 
@@ -1476,7 +1647,7 @@ fn run_browser_delete_job(request: BrowserDeleteRequest) -> Result<RemoteDeleteS
 fn run_download_job(
     input: DownloadInput,
     events: &mpsc::Sender<DownloadWorkerEvent>,
-) -> Result<DownloadSummary> {
+) -> Result<TransferSummary> {
     let aria2_path = find_aria2().ok_or(AppError::MissingAria2)?;
     let store = MacKeychainStore;
     let log_path = create_tui_log_path();
@@ -1551,13 +1722,108 @@ fn run_download_job(
         }
     }
 
-    Ok(DownloadSummary {
+    Ok(TransferSummary {
+        kind: TransferKind::Download,
         reason: selection.reason,
         chosen_url: redact_url_for_display(&selection.chosen),
         output_path: plan.output_path().display().to_string(),
         probes: selection.all_probes,
         auth_hint: !outcome.success && looks_like_auth_error(&outcome.combined_log),
         outcome,
+        log_path: log_path.display().to_string(),
+    })
+}
+
+fn run_upload_job(
+    input: UploadInput,
+    events: &mpsc::Sender<DownloadWorkerEvent>,
+) -> Result<TransferSummary> {
+    let store = MacKeychainStore;
+    let log_path = create_tui_log_path();
+    let _ = events.send(DownloadWorkerEvent::LogPath(log_path.display().to_string()));
+    let _ = events.send(DownloadWorkerEvent::Status(
+        "Preparing FTP upload...".to_string(),
+    ));
+
+    let local_filename = input
+        .local_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("local upload path must include a file name"))?;
+    let remote_path = if input.remote_path.trim().is_empty() {
+        local_filename.to_string()
+    } else if input.remote_path.trim().ends_with('/') {
+        join_remote_path(input.remote_path.trim(), local_filename)
+    } else {
+        input.remote_path.trim().to_string()
+    };
+    let ftp_url = build_remote_url(&input.ftp_base_url, &remote_path, Protocol::Ftp)?;
+    let host = ftp_url
+        .host_str()
+        .ok_or_else(|| AppError::MissingHost(ftp_url.to_string()))?
+        .to_string();
+    let saved_credentials = store.get(&host)?;
+    let (credentials, _) = select_credentials(input.credentials.clone(), saved_credentials);
+
+    let total = input
+        .local_path
+        .metadata()
+        .with_context(|| format!("failed to stat local file {}", input.local_path.display()))?
+        .len();
+    let mut log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("failed to create log file {}", log_path.display()))?;
+    let _ = writeln!(
+        log_file,
+        "fast-movie-dl tui upload log\nlocal_path={}\nftp_url={}\ntotal_bytes={}\n",
+        input.local_path.display(),
+        redact_url(&ftp_url),
+        total
+    );
+
+    let _ = events.send(DownloadWorkerEvent::Progress { sent: 0, total });
+    let _ = events.send(DownloadWorkerEvent::Status(format!(
+        "Uploading {}...",
+        input.local_path.display()
+    )));
+
+    let summary = upload_ftp_file(
+        &input.local_path,
+        ftp_url.as_str(),
+        credentials.as_ref(),
+        |sent, total| {
+            let _ = events.send(DownloadWorkerEvent::Progress { sent, total });
+        },
+    )?;
+
+    let log_line = format!(
+        "Uploaded {} to {} ({})",
+        summary.local_path.display(),
+        summary.target_path,
+        format_bytes_human(summary.bytes_uploaded)
+    );
+    let _ = writeln!(log_file, "{log_line}");
+    let _ = events.send(DownloadWorkerEvent::LogLine(log_line.clone()));
+
+    if input.remember_keychain {
+        if let Some(creds) = &credentials {
+            store
+                .set(&host, creds)
+                .with_context(|| format!("failed to save credentials for host {host}"))?;
+        }
+    }
+
+    Ok(TransferSummary {
+        kind: TransferKind::Upload,
+        reason: "FTP upload".to_string(),
+        chosen_url: input.local_path.display().to_string(),
+        output_path: summary.target_path,
+        probes: Vec::new(),
+        auth_hint: false,
+        outcome: RunOutcome {
+            success: true,
+            exit_code: Some(0),
+            combined_log: log_line,
+        },
         log_path: log_path.display().to_string(),
     })
 }
@@ -1675,6 +1941,19 @@ fn protocol_name(protocol: Protocol) -> &'static str {
         Protocol::Ftp => "FTP",
         Protocol::Unknown => "UNKNOWN",
     }
+}
+
+fn transfer_kind_label(kind: TransferKind) -> &'static str {
+    match kind {
+        TransferKind::Download => "download",
+        TransferKind::Upload => "upload",
+    }
+}
+
+fn redact_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_password(None);
+    redacted.to_string()
 }
 
 fn redact_url_for_display(candidate: &UrlCandidate) -> String {

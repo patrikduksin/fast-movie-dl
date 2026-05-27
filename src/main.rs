@@ -12,12 +12,12 @@ mod tui;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use dialoguer::{Confirm, Input};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Duration;
 use url::Url;
 
 use crate::auth::{prompt_credentials, CredentialStore, Credentials, MacKeychainStore};
-use crate::cli::{AuthArgs, Cli, Commands, DeleteArgs, DownloadArgs, ProtocolArg};
+use crate::cli::{AuthArgs, Cli, Commands, DeleteArgs, DownloadArgs, ProtocolArg, UploadArgs};
 use crate::doctor::{find_aria2, run_doctor};
 use crate::errors::AppError;
 use crate::planner::build_transfer_plan;
@@ -25,7 +25,10 @@ use crate::probe::{
     probe_candidate_for_speed_test, resolve_candidates, select_candidate_with_probe, Protocol,
     SpeedProbeAttempt, SpeedProbeResult, UrlCandidate,
 };
-use crate::remote::{combine_base_and_relative_path, delete_ftp_path, RemoteDeleteKind};
+use crate::remote::{
+    combine_base_and_relative_path, delete_ftp_path, remote_upload_path_from_url, upload_ftp_file,
+    RemoteDeleteKind,
+};
 use crate::runner::{execute_aria2, looks_like_auth_error};
 use crate::tui::run_tui;
 
@@ -37,6 +40,7 @@ fn main() -> Result<()> {
         Commands::Doctor => run_doctor()?,
         Commands::Auth { command } => run_auth(command)?,
         Commands::Download(args) => run_download(args)?,
+        Commands::Upload(args) => run_upload(args)?,
         Commands::Delete(args) => run_delete(args)?,
         Commands::SpeedTest => run_speed_test()?,
     };
@@ -164,6 +168,76 @@ fn run_download(args: DownloadArgs) -> Result<i32> {
     }
 
     bail!("download failed (exit code {:?})", outcome.exit_code)
+}
+
+fn run_upload(args: UploadArgs) -> Result<i32> {
+    let url = Url::parse(&args.url).with_context(|| format!("invalid FTP URL: {}", args.url))?;
+    if url.scheme() != "ftp" {
+        bail!("upload currently supports FTP URLs only");
+    }
+    if !args.local_path.is_file() {
+        bail!(
+            "local upload path is not a file: {}",
+            args.local_path.display()
+        );
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::MissingHost(url.to_string()))?
+        .to_string();
+    let store = MacKeychainStore;
+    let inline_credentials = credentials_from_url(&url);
+    let saved_credentials = if args.no_keychain {
+        None
+    } else {
+        store.get(&host)?
+    };
+    let (credentials, _) = select_credentials(inline_credentials, saved_credentials);
+
+    let target_path = remote_upload_path_from_url(&args.local_path, &args.url)?;
+    println!("Local file: {}", args.local_path.display());
+    println!("Upload URL: {}", redact_url_for_display(&url));
+    println!("Resolved FTP path: {target_path}");
+
+    if args.dry_run {
+        println!("Dry-run: no file was uploaded.");
+        return Ok(0);
+    }
+
+    let total = args
+        .local_path
+        .metadata()
+        .with_context(|| format!("failed to stat local file {}", args.local_path.display()))?
+        .len();
+    let bar = ProgressBar::new(total);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("#>-"),
+    );
+
+    let summary = upload_ftp_file(
+        &args.local_path,
+        &args.url,
+        credentials.as_ref(),
+        |sent, _| {
+            bar.set_position(sent);
+        },
+    )?;
+    bar.finish_with_message("upload complete");
+
+    maybe_store_credentials(&store, &host, &credentials, args.no_keychain)?;
+    println!(
+        "Uploaded {} to {} ({}).",
+        summary.local_path.display(),
+        summary.target_path,
+        format_bytes_human(summary.bytes_uploaded)
+    );
+
+    Ok(0)
 }
 
 fn run_delete(args: DeleteArgs) -> Result<i32> {

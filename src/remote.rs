@@ -1,4 +1,9 @@
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+
 use anyhow::{bail, Context, Result};
+use ftp::types::FileType;
 use ftp::FtpStream;
 use url::Url;
 
@@ -29,6 +34,13 @@ pub struct RemoteDeleteSummary {
     pub deleted_files: u64,
     pub deleted_directories: u64,
     pub kind: RemoteDeleteKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteUploadSummary {
+    pub local_path: PathBuf,
+    pub target_path: String,
+    pub bytes_uploaded: u64,
 }
 
 pub fn list_ftp_directory(
@@ -81,6 +93,46 @@ pub fn list_ftp_directory(
     })
 }
 
+pub fn upload_ftp_file<F>(
+    local_path: &Path,
+    ftp_url: &str,
+    credentials: Option<&Credentials>,
+    mut on_progress: F,
+) -> Result<RemoteUploadSummary>
+where
+    F: FnMut(u64, u64),
+{
+    let url = parse_ftp_base_url(ftp_url)?;
+    let target_path = resolve_upload_target_path(local_path, url.path())?;
+    let total_bytes = local_path
+        .metadata()
+        .with_context(|| format!("failed to stat local file {}", local_path.display()))?
+        .len();
+    let file = File::open(local_path)
+        .with_context(|| format!("failed to open local file {}", local_path.display()))?;
+
+    let mut client = connect_ftp(&url, credentials)?;
+    client
+        .transfer_type(FileType::Binary)
+        .context("failed to set FTP binary transfer mode")?;
+
+    let mut reader = ProgressRead::new(file, total_bytes, |sent, total| {
+        on_progress(sent, total);
+    });
+    client
+        .put(&target_path, &mut reader)
+        .with_context(|| format!("failed to upload to remote path {target_path}"))?;
+
+    let _ = client.quit();
+    on_progress(total_bytes, total_bytes);
+
+    Ok(RemoteUploadSummary {
+        local_path: local_path.to_path_buf(),
+        target_path,
+        bytes_uploaded: total_bytes,
+    })
+}
+
 pub fn delete_ftp_path(
     ftp_url: &str,
     credentials: Option<&Credentials>,
@@ -120,6 +172,11 @@ pub fn delete_ftp_path(
         deleted_directories,
         kind,
     })
+}
+
+pub fn remote_upload_path_from_url(local_path: &Path, ftp_url: &str) -> Result<String> {
+    let url = parse_ftp_base_url(ftp_url)?;
+    resolve_upload_target_path(local_path, url.path())
 }
 
 pub fn normalize_remote_path(value: &str) -> String {
@@ -188,6 +245,54 @@ fn connect_ftp(url: &Url, credentials: Option<&Credentials>) -> Result<FtpStream
         .context("FTP login failed")?;
 
     Ok(client)
+}
+
+fn resolve_upload_target_path(local_path: &Path, url_path: &str) -> Result<String> {
+    let local_filename = local_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("local upload path must include a file name"))?;
+
+    if url_path.is_empty() || url_path.ends_with('/') {
+        let base = combine_base_and_relative_path(url_path, local_filename);
+        return Ok(base);
+    }
+
+    Ok(combine_base_and_relative_path(url_path, ""))
+}
+
+struct ProgressRead<R, F> {
+    inner: R,
+    total: u64,
+    sent: u64,
+    on_progress: F,
+}
+
+impl<R, F> ProgressRead<R, F> {
+    fn new(inner: R, total: u64, on_progress: F) -> Self {
+        Self {
+            inner,
+            total,
+            sent: 0,
+            on_progress,
+        }
+    }
+}
+
+impl<R, F> Read for ProgressRead<R, F>
+where
+    R: Read,
+    F: FnMut(u64, u64),
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if read > 0 {
+            self.sent += read as u64;
+            (self.on_progress)(self.sent, self.total);
+        }
+        Ok(read)
+    }
 }
 
 fn resolve_login_credentials(url: &Url, credentials: Option<&Credentials>) -> (String, String) {
@@ -464,6 +569,28 @@ mod tests {
             combine_base_and_relative_path("/movies/sample.mkv", ""),
             "/movies/sample.mkv"
         );
+    }
+
+    #[test]
+    fn resolves_upload_url_directory_to_local_filename() {
+        let path = remote_upload_path_from_url(
+            Path::new("/tmp/movie.mkv"),
+            "ftp://files.example.com/uploads/",
+        )
+        .expect("expected upload path");
+
+        assert_eq!(path, "/uploads/movie.mkv");
+    }
+
+    #[test]
+    fn resolves_upload_url_file_as_exact_target() {
+        let path = remote_upload_path_from_url(
+            Path::new("/tmp/movie.mkv"),
+            "ftp://files.example.com/uploads/custom.mkv",
+        )
+        .expect("expected upload path");
+
+        assert_eq!(path, "/uploads/custom.mkv");
     }
 
     #[test]

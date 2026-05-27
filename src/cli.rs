@@ -16,6 +16,8 @@ pub enum Commands {
     Tui,
     /// Download a large file with speed-optimized settings
     Download(DownloadArgs),
+    /// Upload a local file to an FTP URL
+    Upload(UploadArgs),
     /// Delete a remote FTP file or directory
     Delete(DeleteArgs),
     /// Run an interactive HTTP vs FTP speed test
@@ -80,6 +82,23 @@ pub struct DownloadArgs {
     pub max_connections: Option<u32>,
 
     /// Print chosen plan and aria2 command without starting download
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UploadArgs {
+    /// Local file to upload
+    pub local_path: PathBuf,
+
+    /// FTP target URL. End with / to upload using the local file name.
+    pub url: String,
+
+    /// Do not read/write credentials in macOS Keychain
+    #[arg(long)]
+    pub no_keychain: bool,
+
+    /// Print the resolved target without uploading anything
     #[arg(long)]
     pub dry_run: bool,
 }
