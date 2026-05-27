@@ -16,6 +16,8 @@ pub enum Commands {
     Tui,
     /// Download a large file with speed-optimized settings
     Download(DownloadArgs),
+    /// Delete a remote FTP file or directory
+    Delete(DeleteArgs),
     /// Run an interactive HTTP vs FTP speed test
     SpeedTest,
     /// Check local prerequisites
@@ -78,6 +80,28 @@ pub struct DownloadArgs {
     pub max_connections: Option<u32>,
 
     /// Print chosen plan and aria2 command without starting download
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// FTP URL for the remote file or directory to delete
+    pub url: String,
+
+    /// Recursively delete directory contents before deleting the directory
+    #[arg(long)]
+    pub recursive: bool,
+
+    /// Confirm deletion without prompting
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Do not read credentials from macOS Keychain
+    #[arg(long)]
+    pub no_keychain: bool,
+
+    /// Print the resolved target without deleting anything
     #[arg(long)]
     pub dry_run: bool,
 }

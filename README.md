@@ -129,6 +129,31 @@ Dry-run (print planned `aria2c` command only):
 fast-movie-dl download "https://files.example.com/movie.mkv" --dry-run
 ```
 
+Delete a remote FTP file:
+
+```bash
+fast-movie-dl delete "ftp://files.example.com/movies/old.mkv"
+```
+
+Delete an empty remote FTP directory:
+
+```bash
+fast-movie-dl delete "ftp://files.example.com/movies/old"
+```
+
+Delete a non-empty remote FTP directory:
+
+```bash
+fast-movie-dl delete "ftp://files.example.com/movies/old" --recursive
+```
+
+Deletion prompts for confirmation by default. Use `--dry-run` to preview the resolved target path or `--yes` for scripts:
+
+```bash
+fast-movie-dl delete "ftp://files.example.com/movies/old.mkv" --dry-run
+fast-movie-dl delete "ftp://files.example.com/movies/old.mkv" --yes
+```
+
 Clear saved credentials for a host:
 
 ```bash
@@ -138,4 +163,5 @@ fast-movie-dl auth clear --host files.example.com
 ## Notes
 
 - For protocol comparison, provide both candidate URLs explicitly (`--ftp-url` or `--http-url`) so the tool can measure both safely.
-- v1 is download-only and does not auto-start playback while downloading.
+- Remote deletion currently supports FTP URLs.
+- v1 does not auto-start playback while downloading.

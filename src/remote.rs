@@ -17,22 +17,28 @@ pub struct RemoteListing {
     pub entries: Vec<RemoteEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RemoteDeleteKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteDeleteSummary {
+    pub target_path: String,
+    pub deleted_files: u64,
+    pub deleted_directories: u64,
+    pub kind: RemoteDeleteKind,
+}
+
 pub fn list_ftp_directory(
     ftp_base_url: &str,
     remote_dir: &str,
     credentials: Option<&Credentials>,
 ) -> Result<RemoteListing> {
     let base_url = parse_ftp_base_url(ftp_base_url)?;
-    let address = ftp_server_address(&base_url)?;
     let target_dir = combine_base_and_relative_path(base_url.path(), remote_dir);
-
-    let mut client = FtpStream::connect(address.as_str())
-        .with_context(|| format!("failed to connect to {address}"))?;
-
-    let (username, password) = resolve_login_credentials(&base_url, credentials);
-    client
-        .login(&username, &password)
-        .context("FTP login failed")?;
+    let mut client = connect_ftp(&base_url, credentials)?;
 
     client
         .cwd(&target_dir)
@@ -72,6 +78,47 @@ pub fn list_ftp_directory(
     Ok(RemoteListing {
         current_dir: normalize_remote_path(remote_dir),
         entries,
+    })
+}
+
+pub fn delete_ftp_path(
+    ftp_url: &str,
+    credentials: Option<&Credentials>,
+    recursive: bool,
+) -> Result<RemoteDeleteSummary> {
+    let url = parse_ftp_base_url(ftp_url)?;
+    let target_path = combine_base_and_relative_path(url.path(), "");
+    if target_path == "/" {
+        bail!("refusing to delete FTP server root");
+    }
+
+    let mut client = connect_ftp(&url, credentials)?;
+    let mut deleted_files = 0;
+    let mut deleted_directories = 0;
+
+    let kind = if recursive {
+        delete_path_recursive(
+            &mut client,
+            &target_path,
+            &mut deleted_files,
+            &mut deleted_directories,
+        )?
+    } else {
+        delete_path_non_recursive(
+            &mut client,
+            &target_path,
+            &mut deleted_files,
+            &mut deleted_directories,
+        )?
+    };
+
+    let _ = client.quit();
+
+    Ok(RemoteDeleteSummary {
+        target_path,
+        deleted_files,
+        deleted_directories,
+        kind,
     })
 }
 
@@ -130,6 +177,19 @@ fn ftp_server_address(url: &Url) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
+fn connect_ftp(url: &Url, credentials: Option<&Credentials>) -> Result<FtpStream> {
+    let address = ftp_server_address(url)?;
+    let mut client = FtpStream::connect(address.as_str())
+        .with_context(|| format!("failed to connect to {address}"))?;
+
+    let (username, password) = resolve_login_credentials(url, credentials);
+    client
+        .login(&username, &password)
+        .context("FTP login failed")?;
+
+    Ok(client)
+}
+
 fn resolve_login_credentials(url: &Url, credentials: Option<&Credentials>) -> (String, String) {
     if let Some(creds) = credentials {
         return (creds.username.clone(), creds.password.clone());
@@ -143,6 +203,84 @@ fn resolve_login_credentials(url: &Url, credentials: Option<&Credentials>) -> (S
     }
 
     ("anonymous".to_string(), "anonymous@".to_string())
+}
+
+fn delete_path_non_recursive(
+    client: &mut FtpStream,
+    target_path: &str,
+    deleted_files: &mut u64,
+    deleted_directories: &mut u64,
+) -> Result<RemoteDeleteKind> {
+    if client.rm(target_path).is_ok() {
+        *deleted_files += 1;
+        return Ok(RemoteDeleteKind::File);
+    }
+
+    client.rmdir(target_path).with_context(|| {
+        format!("failed to delete remote file or empty directory {target_path}")
+    })?;
+    *deleted_directories += 1;
+    Ok(RemoteDeleteKind::Directory)
+}
+
+fn delete_path_recursive(
+    client: &mut FtpStream,
+    target_path: &str,
+    deleted_files: &mut u64,
+    deleted_directories: &mut u64,
+) -> Result<RemoteDeleteKind> {
+    if client.cwd(target_path).is_err() {
+        client
+            .rm(target_path)
+            .with_context(|| format!("failed to delete remote file {target_path}"))?;
+        *deleted_files += 1;
+        return Ok(RemoteDeleteKind::File);
+    }
+
+    let entries = list_current_directory_entries(client)?;
+    let _ = client.cwd("/");
+    for entry in entries {
+        let child_path = join_absolute_remote_path(target_path, &entry.name);
+        if entry.is_dir {
+            delete_path_recursive(client, &child_path, deleted_files, deleted_directories)?;
+        } else {
+            client
+                .rm(&child_path)
+                .with_context(|| format!("failed to delete remote file {child_path}"))?;
+            *deleted_files += 1;
+        }
+    }
+
+    client
+        .rmdir(target_path)
+        .with_context(|| format!("failed to delete remote directory {target_path}"))?;
+    *deleted_directories += 1;
+    Ok(RemoteDeleteKind::Directory)
+}
+
+fn list_current_directory_entries(client: &mut FtpStream) -> Result<Vec<RemoteEntry>> {
+    let list_lines = client.list(None).context("failed to list FTP directory")?;
+    let mut entries: Vec<RemoteEntry> = list_lines
+        .iter()
+        .filter_map(|line| parse_ftp_list_line(line))
+        .collect();
+
+    if !list_lines.is_empty() && entries.is_empty() {
+        if let Ok(names) = client.nlst(None) {
+            entries = names
+                .into_iter()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty() && name != "." && name != "..")
+                .map(|name| RemoteEntry {
+                    name,
+                    is_dir: false,
+                    size_bytes: None,
+                })
+                .collect();
+        }
+    }
+
+    Ok(entries)
 }
 
 pub fn combine_base_and_relative_path(base_path: &str, relative_path: &str) -> String {
@@ -175,6 +313,17 @@ pub fn combine_base_and_relative_path(base_path: &str, relative_path: &str) -> S
         "/".to_string()
     } else {
         format!("/{}", segments.join("/"))
+    }
+}
+
+fn join_absolute_remote_path(parent: &str, child_name: &str) -> String {
+    let parent = parent.trim_end_matches('/');
+    let child = child_name.trim().trim_matches('/');
+
+    if parent.is_empty() {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
     }
 }
 
@@ -307,6 +456,23 @@ mod tests {
             combine_base_and_relative_path("/base/downloads", "../../incoming"),
             "/base/incoming"
         );
+    }
+
+    #[test]
+    fn combines_url_path_without_relative_path() {
+        assert_eq!(
+            combine_base_and_relative_path("/movies/sample.mkv", ""),
+            "/movies/sample.mkv"
+        );
+    }
+
+    #[test]
+    fn joins_absolute_remote_path() {
+        assert_eq!(
+            join_absolute_remote_path("/movies/2026", "sample.mkv"),
+            "/movies/2026/sample.mkv"
+        );
+        assert_eq!(join_absolute_remote_path("/", "sample.mkv"), "/sample.mkv");
     }
 
     #[test]

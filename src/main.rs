@@ -11,13 +11,13 @@ mod tui;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use dialoguer::Input;
+use dialoguer::{Confirm, Input};
 use indicatif::ProgressBar;
 use std::time::Duration;
 use url::Url;
 
 use crate::auth::{prompt_credentials, CredentialStore, Credentials, MacKeychainStore};
-use crate::cli::{AuthArgs, Cli, Commands, DownloadArgs, ProtocolArg};
+use crate::cli::{AuthArgs, Cli, Commands, DeleteArgs, DownloadArgs, ProtocolArg};
 use crate::doctor::{find_aria2, run_doctor};
 use crate::errors::AppError;
 use crate::planner::build_transfer_plan;
@@ -25,6 +25,7 @@ use crate::probe::{
     probe_candidate_for_speed_test, resolve_candidates, select_candidate_with_probe, Protocol,
     SpeedProbeAttempt, SpeedProbeResult, UrlCandidate,
 };
+use crate::remote::{combine_base_and_relative_path, delete_ftp_path, RemoteDeleteKind};
 use crate::runner::{execute_aria2, looks_like_auth_error};
 use crate::tui::run_tui;
 
@@ -36,6 +37,7 @@ fn main() -> Result<()> {
         Commands::Doctor => run_doctor()?,
         Commands::Auth { command } => run_auth(command)?,
         Commands::Download(args) => run_download(args)?,
+        Commands::Delete(args) => run_delete(args)?,
         Commands::SpeedTest => run_speed_test()?,
     };
 
@@ -162,6 +164,66 @@ fn run_download(args: DownloadArgs) -> Result<i32> {
     }
 
     bail!("download failed (exit code {:?})", outcome.exit_code)
+}
+
+fn run_delete(args: DeleteArgs) -> Result<i32> {
+    let url = Url::parse(&args.url).with_context(|| format!("invalid FTP URL: {}", args.url))?;
+    if url.scheme() != "ftp" {
+        bail!("delete currently supports FTP URLs only");
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::MissingHost(url.to_string()))?
+        .to_string();
+    let target_path = combine_base_and_relative_path(url.path(), "");
+    if target_path == "/" {
+        bail!("refusing to delete FTP server root");
+    }
+
+    println!("Delete target: {}", redact_url_for_display(&url));
+    println!("Resolved FTP path: {target_path}");
+    println!("Recursive: {}", if args.recursive { "yes" } else { "no" });
+
+    if args.dry_run {
+        println!("Dry-run: no remote files or directories were deleted.");
+        return Ok(0);
+    }
+
+    if !args.yes {
+        let confirmed = Confirm::new()
+            .with_prompt("Delete this remote target?")
+            .default(false)
+            .interact()
+            .context("delete confirmation failed")?;
+
+        if !confirmed {
+            println!("Delete cancelled.");
+            return Ok(0);
+        }
+    }
+
+    let store = MacKeychainStore;
+    let inline_credentials = credentials_from_url(&url);
+    let saved_credentials = if args.no_keychain {
+        None
+    } else {
+        store.get(&host)?
+    };
+    let (credentials, _) = select_credentials(inline_credentials, saved_credentials);
+
+    let summary = delete_ftp_path(&args.url, credentials.as_ref(), args.recursive)?;
+    let kind = match summary.kind {
+        RemoteDeleteKind::File => "file",
+        RemoteDeleteKind::Directory => "directory",
+    };
+
+    println!(
+        "Deleted remote {kind}: {} ({} file(s), {} directories)",
+        summary.target_path, summary.deleted_files, summary.deleted_directories
+    );
+
+    Ok(0)
 }
 
 fn run_speed_test() -> Result<i32> {
