@@ -24,7 +24,7 @@ pub fn list_ftp_directory(
 ) -> Result<RemoteListing> {
     let base_url = parse_ftp_base_url(ftp_base_url)?;
     let address = ftp_server_address(&base_url)?;
-    let target_dir = combine_base_and_relative_dir(base_url.path(), remote_dir);
+    let target_dir = combine_base_and_relative_path(base_url.path(), remote_dir);
 
     let mut client = FtpStream::connect(address.as_str())
         .with_context(|| format!("failed to connect to {address}"))?;
@@ -105,6 +105,10 @@ pub fn parent_remote_path(current_dir: &str) -> String {
         return String::new();
     }
 
+    if normalized == ".." {
+        return normalized;
+    }
+
     let mut segments: Vec<&str> = normalized.split('/').collect();
     let _ = segments.pop();
     segments.join("/")
@@ -141,19 +145,31 @@ fn resolve_login_credentials(url: &Url, credentials: Option<&Credentials>) -> (S
     ("anonymous".to_string(), "anonymous@".to_string())
 }
 
-fn combine_base_and_relative_dir(base_path: &str, relative_dir: &str) -> String {
+pub fn combine_base_and_relative_path(base_path: &str, relative_path: &str) -> String {
     let mut segments = base_path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(str::to_string)
         .collect::<Vec<String>>();
+    let minimum_depth = segments.len().saturating_sub(1);
 
-    segments.extend(
-        normalize_remote_path(relative_dir)
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_string),
-    );
+    for segment in normalize_remote_path(relative_path)
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        if segment == "." {
+            continue;
+        }
+
+        if segment == ".." {
+            if segments.len() > minimum_depth {
+                let _ = segments.pop();
+            }
+            continue;
+        }
+
+        segments.push(segment.to_string());
+    }
 
     if segments.is_empty() {
         "/".to_string()
@@ -269,13 +285,27 @@ mod tests {
     fn computes_parent_remote_path() {
         assert_eq!(parent_remote_path("movies/2026"), "movies");
         assert_eq!(parent_remote_path("movies"), "");
+        assert_eq!(parent_remote_path(""), "");
+        assert_eq!(parent_remote_path(".."), "..");
     }
 
     #[test]
     fn combines_base_and_relative_directory() {
         assert_eq!(
-            combine_base_and_relative_dir("/base", "movies/2026"),
+            combine_base_and_relative_path("/base", "movies/2026"),
             "/base/movies/2026"
+        );
+    }
+
+    #[test]
+    fn combines_one_parent_above_base_directory() {
+        assert_eq!(
+            combine_base_and_relative_path("/downloads", "../incoming"),
+            "/incoming"
+        );
+        assert_eq!(
+            combine_base_and_relative_path("/base/downloads", "../../incoming"),
+            "/base/incoming"
         );
     }
 

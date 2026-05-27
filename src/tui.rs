@@ -28,8 +28,8 @@ use crate::probe::{
     resolve_candidates, select_candidate_with_probe, Protocol, SpeedProbeResult, UrlCandidate,
 };
 use crate::remote::{
-    join_remote_path, list_ftp_directory, normalize_remote_path, parent_remote_path, RemoteEntry,
-    RemoteListing,
+    combine_base_and_relative_path, join_remote_path, list_ftp_directory, normalize_remote_path,
+    parent_remote_path, RemoteEntry, RemoteListing,
 };
 use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunOutcome};
 
@@ -666,7 +666,8 @@ impl TuiApp {
                 }
             }
             KeyCode::Char('h') | KeyCode::Backspace => {
-                let parent = parent_remote_path(&self.browser_current_dir);
+                let parent =
+                    browser_parent_remote_path(&self.browser_current_dir, &self.form.ftp_base_url);
                 if parent != self.browser_current_dir {
                     self.browser_current_dir = parent;
                     self.browser_selected = 0;
@@ -1451,18 +1452,30 @@ fn build_remote_url(base: &str, remote_path: &str, expected_protocol: Protocol) 
         bail!("remote path cannot be empty");
     }
 
-    if !base_url.path().ends_with('/') {
-        let mut path = base_url.path().to_string();
-        path.push('/');
-        base_url.set_path(&path);
+    let path = combine_base_and_relative_path(base_url.path(), trimmed_remote_path);
+    base_url.set_path(&path);
+    Ok(base_url)
+}
+
+fn browser_parent_remote_path(current_dir: &str, ftp_base_url: &str) -> String {
+    let normalized = normalize_remote_path(current_dir);
+    if !normalized.is_empty() {
+        return parent_remote_path(&normalized);
     }
 
-    base_url.join(trimmed_remote_path).with_context(|| {
-        format!(
-            "failed to combine {} base URL with remote path {trimmed_remote_path}",
-            protocol_name(expected_protocol)
-        )
-    })
+    let Ok(base_url) = Url::parse(ftp_base_url.trim()) else {
+        return normalized;
+    };
+
+    if base_url
+        .path()
+        .split('/')
+        .any(|segment| !segment.is_empty())
+    {
+        "..".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn select_credentials(
@@ -1546,6 +1559,52 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "https://files.example.com/base/movies/2026/sample.mkv"
+        );
+    }
+
+    #[test]
+    fn builds_remote_url_one_parent_above_base() {
+        let url = build_remote_url(
+            "https://files.example.com/downloads",
+            "../incoming/sample.mkv",
+            Protocol::Http,
+        )
+        .expect("expected valid URL");
+
+        assert_eq!(
+            url.as_str(),
+            "https://files.example.com/incoming/sample.mkv"
+        );
+    }
+
+    #[test]
+    fn build_remote_url_does_not_escape_more_than_one_parent() {
+        let url = build_remote_url(
+            "https://files.example.com/base/downloads",
+            "../../incoming/sample.mkv",
+            Protocol::Http,
+        )
+        .expect("expected valid URL");
+
+        assert_eq!(
+            url.as_str(),
+            "https://files.example.com/base/incoming/sample.mkv"
+        );
+    }
+
+    #[test]
+    fn browser_parent_allows_one_parent_above_non_root_base() {
+        assert_eq!(
+            browser_parent_remote_path("", "ftp://files.example.com/downloads"),
+            ".."
+        );
+    }
+
+    #[test]
+    fn browser_parent_stays_at_root_for_root_base() {
+        assert_eq!(
+            browser_parent_remote_path("", "ftp://files.example.com"),
+            ""
         );
     }
 
