@@ -76,7 +76,8 @@ fn run_config_export(args: ConfigExportArgs) -> Result<i32> {
         }
     } else {
         config
-    };
+    }
+    .without_output_dirs();
 
     export.save_to_path(&args.out)?;
 

@@ -84,15 +84,30 @@ impl AppConfig {
         self.profiles.iter().find(|item| item.name == name)
     }
 
+    pub fn without_output_dirs(mut self) -> Self {
+        for profile in &mut self.profiles {
+            profile.output_dir = None;
+        }
+
+        self
+    }
+
     pub fn import_profiles(&mut self, profiles: Vec<MachineProfile>, replace: bool) -> usize {
         let mut imported = 0;
 
-        for profile in profiles {
-            let exists = self.profiles.iter().any(|item| item.name == profile.name);
+        for mut profile in profiles {
+            let existing_output_dir = self
+                .profiles
+                .iter()
+                .find(|item| item.name == profile.name)
+                .and_then(|item| item.output_dir.clone());
+            let exists = existing_output_dir.is_some()
+                || self.profiles.iter().any(|item| item.name == profile.name);
             if exists && !replace {
                 continue;
             }
 
+            profile.output_dir = existing_output_dir;
             self.upsert_profile(profile);
             imported += 1;
         }
@@ -205,7 +220,7 @@ mod tests {
             name: "server".to_string(),
             http_base_url: "https://a.example.com".to_string(),
             ftp_base_url: "ftp://a.example.com".to_string(),
-            output_dir: None,
+            output_dir: Some(PathBuf::from("/local/movies")),
             last_remote_dir: None,
         });
 
@@ -224,7 +239,26 @@ mod tests {
         assert_eq!(config.profiles[0].http_base_url, "https://b.example.com");
         assert_eq!(
             config.profiles[0].output_dir,
-            Some(PathBuf::from("/movies"))
+            Some(PathBuf::from("/local/movies"))
         );
+    }
+
+    #[test]
+    fn export_config_omits_output_dirs() {
+        let export = AppConfig {
+            profiles: vec![MachineProfile {
+                name: "server".to_string(),
+                http_base_url: "https://a.example.com".to_string(),
+                ftp_base_url: "ftp://a.example.com".to_string(),
+                output_dir: Some(PathBuf::from("/movies")),
+                last_remote_dir: Some("movies".to_string()),
+            }],
+        }
+        .without_output_dirs();
+
+        let encoded = toml::to_string_pretty(&export).expect("encode config");
+
+        assert!(!encoded.contains("output_dir"));
+        assert!(encoded.contains("last_remote_dir"));
     }
 }

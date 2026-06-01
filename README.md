@@ -239,7 +239,7 @@ Existing profile names are skipped by default. Use `--replace` to overwrite them
 fast-movie-dl config import ./movie-profiles.toml --replace
 ```
 
-Profile exports include saved HTTP/FTP base URLs, default output directory, and last remote directory. They do not include credentials; each person keeps their own credentials in Keychain.
+Profile exports include saved HTTP/FTP base URLs and last remote directory. They do not include credentials or default output directories; each person keeps their own credentials and local output directory.
 
 ## Notes
 
