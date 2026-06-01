@@ -16,7 +16,7 @@ pub enum Commands {
     Tui,
     /// Download a large file with speed-optimized settings
     Download(DownloadArgs),
-    /// Upload a local file to an FTP URL
+    /// Upload a local file or directory to an FTP URL
     Upload(UploadArgs),
     /// Delete a remote FTP file or directory
     Delete(DeleteArgs),
@@ -122,10 +122,10 @@ pub struct DownloadArgs {
 
 #[derive(Debug, Args)]
 pub struct UploadArgs {
-    /// Local file to upload
+    /// Local file or directory to upload
     pub local_path: PathBuf,
 
-    /// FTP target URL. End with / to upload using the local file name.
+    /// FTP target URL. End with / to upload under the local file/directory name.
     pub url: String,
 
     /// Do not read/write credentials in macOS Keychain

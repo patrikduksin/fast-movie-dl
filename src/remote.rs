@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -41,6 +41,20 @@ pub struct RemoteUploadSummary {
     pub local_path: PathBuf,
     pub target_path: String,
     pub bytes_uploaded: u64,
+    pub files_uploaded: u64,
+    pub directories_created: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteUploadProgress {
+    pub current_file: PathBuf,
+    pub target_path: String,
+    pub file_sent: u64,
+    pub file_total: u64,
+    pub total_sent: u64,
+    pub total_bytes: u64,
+    pub files_done: u64,
+    pub files_total: u64,
 }
 
 pub fn list_ftp_directory(
@@ -93,43 +107,83 @@ pub fn list_ftp_directory(
     })
 }
 
-pub fn upload_ftp_file<F>(
+pub fn upload_ftp_path<F>(
     local_path: &Path,
     ftp_url: &str,
     credentials: Option<&Credentials>,
     mut on_progress: F,
 ) -> Result<RemoteUploadSummary>
 where
-    F: FnMut(u64, u64),
+    F: FnMut(RemoteUploadProgress),
 {
     let url = parse_ftp_base_url(ftp_url)?;
     let target_path = resolve_upload_target_path(local_path, url.path())?;
-    let total_bytes = local_path
-        .metadata()
-        .with_context(|| format!("failed to stat local file {}", local_path.display()))?
-        .len();
-    let file = File::open(local_path)
-        .with_context(|| format!("failed to open local file {}", local_path.display()))?;
+    let plan = build_upload_plan(local_path, &target_path)?;
 
     let mut client = connect_ftp(&url, credentials)?;
     client
         .transfer_type(FileType::Binary)
         .context("failed to set FTP binary transfer mode")?;
 
-    let mut reader = ProgressRead::new(file, total_bytes, |sent, total| {
-        on_progress(sent, total);
-    });
-    client
-        .put(&target_path, &mut reader)
-        .with_context(|| format!("failed to upload to remote path {target_path}"))?;
+    let mut total_sent = 0;
+    let mut files_done = 0;
+    let mut directories_created = 0;
+
+    for directory in &plan.directories {
+        ensure_remote_directory(&mut client, directory)?;
+        directories_created += 1;
+    }
+
+    for file_item in &plan.files {
+        let file = File::open(&file_item.local_path).with_context(|| {
+            format!(
+                "failed to open local file {}",
+                file_item.local_path.display()
+            )
+        })?;
+
+        on_progress(RemoteUploadProgress {
+            current_file: file_item.local_path.clone(),
+            target_path: file_item.target_path.clone(),
+            file_sent: 0,
+            file_total: file_item.size_bytes,
+            total_sent,
+            total_bytes: plan.total_bytes,
+            files_done,
+            files_total: plan.files.len() as u64,
+        });
+
+        let mut reader = ProgressRead::new(file, file_item.size_bytes, |sent, total| {
+            on_progress(RemoteUploadProgress {
+                current_file: file_item.local_path.clone(),
+                target_path: file_item.target_path.clone(),
+                file_sent: sent,
+                file_total: total,
+                total_sent: total_sent + sent,
+                total_bytes: plan.total_bytes,
+                files_done,
+                files_total: plan.files.len() as u64,
+            });
+        });
+
+        client
+            .put(&file_item.target_path, &mut reader)
+            .with_context(|| {
+                format!("failed to upload to remote path {}", file_item.target_path)
+            })?;
+
+        total_sent += file_item.size_bytes;
+        files_done += 1;
+    }
 
     let _ = client.quit();
-    on_progress(total_bytes, total_bytes);
 
     Ok(RemoteUploadSummary {
         local_path: local_path.to_path_buf(),
         target_path,
-        bytes_uploaded: total_bytes,
+        bytes_uploaded: plan.total_bytes,
+        files_uploaded: files_done,
+        directories_created,
     })
 }
 
@@ -260,6 +314,164 @@ fn resolve_upload_target_path(local_path: &Path, url_path: &str) -> Result<Strin
     }
 
     Ok(combine_base_and_relative_path(url_path, ""))
+}
+
+#[derive(Debug)]
+struct UploadPlan {
+    directories: Vec<String>,
+    files: Vec<UploadFileItem>,
+    total_bytes: u64,
+}
+
+#[derive(Debug)]
+struct UploadFileItem {
+    local_path: PathBuf,
+    target_path: String,
+    size_bytes: u64,
+}
+
+fn build_upload_plan(local_path: &Path, target_path: &str) -> Result<UploadPlan> {
+    let metadata = local_path
+        .metadata()
+        .with_context(|| format!("failed to stat local upload path {}", local_path.display()))?;
+
+    if metadata.is_file() {
+        return Ok(UploadPlan {
+            directories: parent_remote_directory(target_path).into_iter().collect(),
+            files: vec![UploadFileItem {
+                local_path: local_path.to_path_buf(),
+                target_path: target_path.to_string(),
+                size_bytes: metadata.len(),
+            }],
+            total_bytes: metadata.len(),
+        });
+    }
+
+    if !metadata.is_dir() {
+        bail!(
+            "local upload path is not a file or directory: {}",
+            local_path.display()
+        );
+    }
+
+    let mut directories = vec![target_path.to_string()];
+    let mut files = Vec::new();
+    collect_directory_upload_items(
+        local_path,
+        local_path,
+        target_path,
+        &mut directories,
+        &mut files,
+    )?;
+
+    directories.sort();
+    directories.dedup();
+    directories.sort_by_key(|path| path.matches('/').count());
+
+    let total_bytes = files.iter().map(|item| item.size_bytes).sum();
+
+    Ok(UploadPlan {
+        directories,
+        files,
+        total_bytes,
+    })
+}
+
+fn collect_directory_upload_items(
+    root: &Path,
+    current: &Path,
+    target_root: &str,
+    directories: &mut Vec<String>,
+    files: &mut Vec<UploadFileItem>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(current)
+        .with_context(|| format!("failed to read directory {}", current.display()))?
+        .collect::<std::result::Result<Vec<_>, io::Error>>()
+        .with_context(|| format!("failed to read directory entry in {}", current.display()))?;
+
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("failed to compute relative path for {}", path.display()))?;
+        let remote_path = join_remote_relative_path(target_root, relative)?;
+
+        if metadata.is_dir() {
+            directories.push(remote_path.clone());
+            collect_directory_upload_items(root, &path, target_root, directories, files)?;
+        } else if metadata.is_file() {
+            files.push(UploadFileItem {
+                local_path: path,
+                target_path: remote_path,
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn join_remote_relative_path(target_root: &str, relative: &Path) -> Result<String> {
+    let mut result = target_root.trim_end_matches('/').to_string();
+
+    for component in relative.components() {
+        let segment = component
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("upload path contains non-UTF-8 segment"))?;
+        if segment.is_empty() {
+            continue;
+        }
+        result.push('/');
+        result.push_str(segment);
+    }
+
+    if result.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(result)
+    }
+}
+
+fn parent_remote_directory(target_path: &str) -> Option<String> {
+    let trimmed = target_path.trim_end_matches('/');
+    let (parent, _) = trimmed.rsplit_once('/')?;
+
+    if parent.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(parent.to_string())
+    }
+}
+
+fn ensure_remote_directory(client: &mut FtpStream, target_path: &str) -> Result<()> {
+    if target_path == "/" {
+        return Ok(());
+    }
+
+    let mut current = String::new();
+    for segment in target_path.split('/').filter(|segment| !segment.is_empty()) {
+        current.push('/');
+        current.push_str(segment);
+
+        if client.cwd(&current).is_ok() {
+            let _ = client.cwd("/");
+            continue;
+        }
+
+        let _ = client.cwd("/");
+        if client.mkdir(&current).is_err() && client.cwd(&current).is_err() {
+            bail!("failed to create remote directory {current}");
+        }
+        let _ = client.cwd("/");
+    }
+
+    Ok(())
 }
 
 struct ProgressRead<R, F> {
@@ -591,6 +803,47 @@ mod tests {
         .expect("expected upload path");
 
         assert_eq!(path, "/uploads/custom.mkv");
+    }
+
+    #[test]
+    fn resolves_directory_upload_url_directory_to_local_directory_name() {
+        let temp = tempfile::tempdir().expect("expected temp dir");
+        let local_dir = temp.path().join("movies");
+        std::fs::create_dir(&local_dir).expect("expected local dir");
+
+        let path = remote_upload_path_from_url(&local_dir, "ftp://files.example.com/uploads/")
+            .expect("expected upload path");
+
+        assert_eq!(path, "/uploads/movies");
+    }
+
+    #[test]
+    fn plans_nested_directory_upload() {
+        let temp = tempfile::tempdir().expect("expected temp dir");
+        let local_dir = temp.path().join("movies");
+        let nested_dir = local_dir.join("set");
+        std::fs::create_dir(&local_dir).expect("expected local dir");
+        std::fs::create_dir(&nested_dir).expect("expected nested dir");
+        std::fs::write(local_dir.join("a.mkv"), b"aaa").expect("expected file");
+        std::fs::write(nested_dir.join("b.mkv"), b"bbbb").expect("expected nested file");
+
+        let plan = build_upload_plan(&local_dir, "/uploads/movies").expect("expected upload plan");
+
+        assert_eq!(plan.total_bytes, 7);
+        assert_eq!(
+            plan.directories,
+            vec![
+                "/uploads/movies".to_string(),
+                "/uploads/movies/set".to_string()
+            ]
+        );
+        assert_eq!(
+            plan.files
+                .iter()
+                .map(|item| item.target_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/uploads/movies/a.mkv", "/uploads/movies/set/b.mkv"]
+        );
     }
 
     #[test]

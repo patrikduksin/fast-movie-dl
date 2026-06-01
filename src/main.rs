@@ -30,7 +30,7 @@ use crate::probe::{
     SpeedProbeAttempt, SpeedProbeResult, UrlCandidate,
 };
 use crate::remote::{
-    combine_base_and_relative_path, delete_ftp_path, remote_upload_path_from_url, upload_ftp_file,
+    combine_base_and_relative_path, delete_ftp_path, remote_upload_path_from_url, upload_ftp_path,
     RemoteDeleteKind,
 };
 use crate::runner::{execute_aria2, looks_like_auth_error};
@@ -237,9 +237,9 @@ fn run_upload(args: UploadArgs) -> Result<i32> {
     if url.scheme() != "ftp" {
         bail!("upload currently supports FTP URLs only");
     }
-    if !args.local_path.is_file() {
+    if !args.local_path.is_file() && !args.local_path.is_dir() {
         bail!(
-            "local upload path is not a file: {}",
+            "local upload path is not a file or directory: {}",
             args.local_path.display()
         );
     }
@@ -263,40 +263,45 @@ fn run_upload(args: UploadArgs) -> Result<i32> {
     println!("Resolved FTP path: {target_path}");
 
     if args.dry_run {
-        println!("Dry-run: no file was uploaded.");
+        println!("Dry-run: nothing was uploaded.");
         return Ok(0);
     }
 
-    let total = args
-        .local_path
-        .metadata()
-        .with_context(|| format!("failed to stat local file {}", args.local_path.display()))?
-        .len();
-    let bar = ProgressBar::new(total);
+    let bar = ProgressBar::new_spinner();
     bar.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+            "{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) {msg}",
         )
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("#>-"),
     );
+    bar.enable_steady_tick(Duration::from_millis(120));
 
-    let summary = upload_ftp_file(
+    let summary = upload_ftp_path(
         &args.local_path,
         &args.url,
         credentials.as_ref(),
-        |sent, _| {
-            bar.set_position(sent);
+        |progress| {
+            bar.set_length(progress.total_bytes);
+            bar.set_position(progress.total_sent);
+            bar.set_message(format!(
+                "{}/{} {}",
+                progress.files_done + 1,
+                progress.files_total.max(1),
+                progress.current_file.display()
+            ));
         },
     )?;
     bar.finish_with_message("upload complete");
 
     maybe_store_credentials(&store, &host, &credentials, args.no_keychain)?;
     println!(
-        "Uploaded {} to {} ({}).",
+        "Uploaded {} to {} ({} across {} file(s), {} directories).",
         summary.local_path.display(),
         summary.target_path,
-        format_bytes_human(summary.bytes_uploaded)
+        format_bytes_human(summary.bytes_uploaded),
+        summary.files_uploaded,
+        summary.directories_created
     );
 
     Ok(0)

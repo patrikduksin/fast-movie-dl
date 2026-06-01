@@ -1,0 +1,27 @@
+[tools]
+rust = "1.93.0"
+"asdf:https://github.com/asdf-community/asdf-aria2.git#410619ddcec0b7bfe7df34bd15ced4f4a245a444" = "1.37.0"
+
+[tasks.build]
+description = "Build the CLI"
+run = "cargo build"
+
+[tasks.release]
+description = "Build the release binary"
+run = "cargo build --release"
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run clippy with warnings denied"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.doctor]
+description = "Check local runtime dependencies"
+run = "cargo run -- doctor"

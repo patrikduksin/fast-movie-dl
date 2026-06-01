@@ -8,7 +8,7 @@ Speed-focused CLI for downloading huge movie files over HTTP/HTTPS/FTP using `ar
 - Auto-resumes interrupted downloads.
 - Supports protocol auto mode with short throughput probing when both HTTP and FTP URLs are provided.
 - In auto mode, defaults to FTP when probe results are unavailable or too close to call.
-- Uploads local files to FTP targets with byte progress.
+- Uploads local files or directories to FTP targets with byte progress.
 - Includes an interactive manual speed test for HTTP vs FTP using the same remote file path.
 - Exports and imports saved machine profiles for sharing remote configs.
 - Prompts for credentials on auth failures and stores them in macOS Keychain by host.
@@ -16,19 +16,33 @@ Speed-focused CLI for downloading huge movie files over HTTP/HTTPS/FTP using `ar
 ## Requirements
 
 - macOS
-- Rust toolchain (`cargo`, `rustc`)
-- `aria2c`
+- `mise`
 
-Install `aria2c`:
+Install project tools:
 
 ```bash
-brew install aria2
+mise i
+```
+
+This installs the pinned Rust toolchain and `aria2c` for the project. If your
+shell is not already activating mise, run commands through `mise x -- ...`:
+
+```bash
+mise x -- cargo run -- doctor
+```
+
+Optional task shortcuts:
+
+```bash
+mise run build
+mise run test
+mise run doctor
 ```
 
 ## Build
 
 ```bash
-cargo build --release
+mise run release
 ```
 
 Binary path:
@@ -62,7 +76,7 @@ TUI workflow:
 - Save reusable machine profiles (HTTP base URL, FTP base URL, default output directory).
 - Pick a profile and browse remote FTP directories.
 - Select a file to auto-probe HTTP vs FTP and start download.
-- Set an upload local file path in the edit screen, then upload it to the current remote directory from the browser.
+- Set an upload local file or directory path in the edit screen, then upload it to the current remote directory from the browser.
 - Watch live logs and progress in the running screen; full session log is also saved to a temp file.
 - Review result and log tail in the same UI.
 
@@ -154,6 +168,20 @@ fast-movie-dl upload "/Users/you/Movies/source.mkv" \
   "ftp://alice:secret@files.example.com/uploads/" --dry-run
 fast-movie-dl upload "/Users/you/Movies/source.mkv" \
   "ftp://files.example.com/uploads/" --no-keychain
+```
+
+Upload a directory recursively:
+
+```bash
+fast-movie-dl upload "/Users/you/Movies/Season 1" \
+  "ftp://files.example.com/uploads/"
+```
+
+That creates `/uploads/Season 1/` and uploads all nested files. To choose the exact remote directory name:
+
+```bash
+fast-movie-dl upload "/Users/you/Movies/Season 1" \
+  "ftp://files.example.com/uploads/show-s01"
 ```
 
 Delete a remote FTP file:

@@ -29,7 +29,7 @@ use crate::probe::{
 };
 use crate::remote::{
     combine_base_and_relative_path, delete_ftp_path, join_remote_path, list_ftp_directory,
-    normalize_remote_path, parent_remote_path, upload_ftp_file, RemoteDeleteSummary, RemoteEntry,
+    normalize_remote_path, parent_remote_path, upload_ftp_path, RemoteDeleteSummary, RemoteEntry,
     RemoteListing,
 };
 use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunOutcome};
@@ -242,8 +242,11 @@ impl FormState {
         }
 
         let local_path = PathBuf::from(local_path);
-        if !local_path.is_file() {
-            bail!("local upload path is not a file: {}", local_path.display());
+        if !local_path.is_file() && !local_path.is_dir() {
+            bail!(
+                "local upload path is not a file or directory: {}",
+                local_path.display()
+            );
         }
         let local_filename = local_path
             .file_name()
@@ -1765,41 +1768,45 @@ fn run_upload_job(
     let saved_credentials = store.get(&host)?;
     let (credentials, _) = select_credentials(input.credentials.clone(), saved_credentials);
 
-    let total = input
-        .local_path
-        .metadata()
-        .with_context(|| format!("failed to stat local file {}", input.local_path.display()))?
-        .len();
     let mut log_file = std::fs::File::create(&log_path)
         .with_context(|| format!("failed to create log file {}", log_path.display()))?;
     let _ = writeln!(
         log_file,
-        "fast-movie-dl tui upload log\nlocal_path={}\nftp_url={}\ntotal_bytes={}\n",
+        "fast-movie-dl tui upload log\nlocal_path={}\nftp_url={}\n",
         input.local_path.display(),
-        redact_url(&ftp_url),
-        total
+        redact_url(&ftp_url)
     );
 
-    let _ = events.send(DownloadWorkerEvent::Progress { sent: 0, total });
     let _ = events.send(DownloadWorkerEvent::Status(format!(
         "Uploading {}...",
         input.local_path.display()
     )));
 
-    let summary = upload_ftp_file(
+    let summary = upload_ftp_path(
         &input.local_path,
         ftp_url.as_str(),
         credentials.as_ref(),
-        |sent, total| {
-            let _ = events.send(DownloadWorkerEvent::Progress { sent, total });
+        |progress| {
+            let _ = events.send(DownloadWorkerEvent::Progress {
+                sent: progress.total_sent,
+                total: progress.total_bytes,
+            });
+            let _ = events.send(DownloadWorkerEvent::Status(format!(
+                "Uploading {}/{}: {}",
+                progress.files_done + 1,
+                progress.files_total.max(1),
+                progress.current_file.display()
+            )));
         },
     )?;
 
     let log_line = format!(
-        "Uploaded {} to {} ({})",
+        "Uploaded {} to {} ({} across {} file(s), {} directories)",
         summary.local_path.display(),
         summary.target_path,
-        format_bytes_human(summary.bytes_uploaded)
+        format_bytes_human(summary.bytes_uploaded),
+        summary.files_uploaded,
+        summary.directories_created
     );
     let _ = writeln!(log_file, "{log_line}");
     let _ = events.send(DownloadWorkerEvent::LogLine(log_line.clone()));
