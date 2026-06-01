@@ -79,6 +79,26 @@ impl AppConfig {
             self.profiles.remove(index);
         }
     }
+
+    pub fn profile_by_name(&self, name: &str) -> Option<&MachineProfile> {
+        self.profiles.iter().find(|item| item.name == name)
+    }
+
+    pub fn import_profiles(&mut self, profiles: Vec<MachineProfile>, replace: bool) -> usize {
+        let mut imported = 0;
+
+        for profile in profiles {
+            let exists = self.profiles.iter().any(|item| item.name == profile.name);
+            if exists && !replace {
+                continue;
+            }
+
+            self.upsert_profile(profile);
+            imported += 1;
+        }
+
+        imported
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -149,6 +169,62 @@ mod tests {
         assert_eq!(
             config.profiles[0].last_remote_dir,
             Some("movies".to_string())
+        );
+    }
+
+    #[test]
+    fn import_skips_existing_profiles_without_replace() {
+        let mut config = AppConfig::default();
+        config.upsert_profile(MachineProfile {
+            name: "server".to_string(),
+            http_base_url: "https://a.example.com".to_string(),
+            ftp_base_url: "ftp://a.example.com".to_string(),
+            output_dir: None,
+            last_remote_dir: None,
+        });
+
+        let imported = config.import_profiles(
+            vec![MachineProfile {
+                name: "server".to_string(),
+                http_base_url: "https://b.example.com".to_string(),
+                ftp_base_url: "ftp://b.example.com".to_string(),
+                output_dir: Some(PathBuf::from("/movies")),
+                last_remote_dir: Some("movies".to_string()),
+            }],
+            false,
+        );
+
+        assert_eq!(imported, 0);
+        assert_eq!(config.profiles[0].http_base_url, "https://a.example.com");
+    }
+
+    #[test]
+    fn import_replaces_existing_profiles_when_requested() {
+        let mut config = AppConfig::default();
+        config.upsert_profile(MachineProfile {
+            name: "server".to_string(),
+            http_base_url: "https://a.example.com".to_string(),
+            ftp_base_url: "ftp://a.example.com".to_string(),
+            output_dir: None,
+            last_remote_dir: None,
+        });
+
+        let imported = config.import_profiles(
+            vec![MachineProfile {
+                name: "server".to_string(),
+                http_base_url: "https://b.example.com".to_string(),
+                ftp_base_url: "ftp://b.example.com".to_string(),
+                output_dir: Some(PathBuf::from("/movies")),
+                last_remote_dir: Some("movies".to_string()),
+            }],
+            true,
+        );
+
+        assert_eq!(imported, 1);
+        assert_eq!(config.profiles[0].http_base_url, "https://b.example.com");
+        assert_eq!(
+            config.profiles[0].output_dir,
+            Some(PathBuf::from("/movies"))
         );
     }
 }

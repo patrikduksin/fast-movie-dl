@@ -10,6 +10,7 @@ Speed-focused CLI for downloading huge movie files over HTTP/HTTPS/FTP using `ar
 - In auto mode, defaults to FTP when probe results are unavailable or too close to call.
 - Uploads local files to FTP targets with byte progress.
 - Includes an interactive manual speed test for HTTP vs FTP using the same remote file path.
+- Exports and imports saved machine profiles for sharing remote configs.
 - Prompts for credentials on auth failures and stores them in macOS Keychain by host.
 
 ## Requirements
@@ -185,6 +186,32 @@ Clear saved credentials for a host:
 ```bash
 fast-movie-dl auth clear --host files.example.com
 ```
+
+Export saved machine profiles to share:
+
+```bash
+fast-movie-dl config export --out ./movie-profiles.toml
+```
+
+Export a single profile:
+
+```bash
+fast-movie-dl config export --profile lab-server --out ./lab-server.toml
+```
+
+Import profiles from a shared file:
+
+```bash
+fast-movie-dl config import ./movie-profiles.toml
+```
+
+Existing profile names are skipped by default. Use `--replace` to overwrite them:
+
+```bash
+fast-movie-dl config import ./movie-profiles.toml --replace
+```
+
+Profile exports include saved HTTP/FTP base URLs, default output directory, and last remote directory. They do not include credentials; each person keeps their own credentials in Keychain.
 
 ## Notes
 

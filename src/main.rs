@@ -17,7 +17,11 @@ use std::time::Duration;
 use url::Url;
 
 use crate::auth::{prompt_credentials, CredentialStore, Credentials, MacKeychainStore};
-use crate::cli::{AuthArgs, Cli, Commands, DeleteArgs, DownloadArgs, ProtocolArg, UploadArgs};
+use crate::cli::{
+    AuthArgs, Cli, Commands, ConfigArgs, ConfigExportArgs, ConfigImportArgs, DeleteArgs,
+    DownloadArgs, ProtocolArg, UploadArgs,
+};
+use crate::config::AppConfig;
 use crate::doctor::{find_aria2, run_doctor};
 use crate::errors::AppError;
 use crate::planner::build_transfer_plan;
@@ -38,6 +42,7 @@ fn main() -> Result<()> {
     let code = match cli.command {
         Commands::Tui => run_tui()?,
         Commands::Doctor => run_doctor()?,
+        Commands::Config { command } => run_config(command)?,
         Commands::Auth { command } => run_auth(command)?,
         Commands::Download(args) => run_download(args)?,
         Commands::Upload(args) => run_upload(args)?,
@@ -50,6 +55,63 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_config(command: ConfigArgs) -> Result<i32> {
+    match command {
+        ConfigArgs::Export(args) => run_config_export(args),
+        ConfigArgs::Import(args) => run_config_import(args),
+    }
+}
+
+fn run_config_export(args: ConfigExportArgs) -> Result<i32> {
+    let config = AppConfig::load()?;
+    let export = if let Some(profile_name) = args.profile.as_deref() {
+        let profile = config
+            .profile_by_name(profile_name)
+            .with_context(|| format!("profile not found: {profile_name}"))?;
+
+        AppConfig {
+            profiles: vec![profile.clone()],
+        }
+    } else {
+        config
+    };
+
+    export.save_to_path(&args.out)?;
+
+    println!(
+        "Exported {} profile(s) to {}.",
+        export.profiles.len(),
+        args.out.display()
+    );
+    println!("Credentials are not included; friends will enter or save their own.");
+
+    Ok(0)
+}
+
+fn run_config_import(args: ConfigImportArgs) -> Result<i32> {
+    if !args.file.exists() {
+        bail!("config import file does not exist: {}", args.file.display());
+    }
+
+    let import = AppConfig::load_from_path(&args.file)?;
+    let import_count = import.profiles.len();
+
+    let mut config = AppConfig::load()?;
+    let imported = config.import_profiles(import.profiles, args.replace);
+    config.save()?;
+
+    println!(
+        "Imported {imported} of {import_count} profile(s) from {}.",
+        args.file.display()
+    );
+
+    if imported < import_count && !args.replace {
+        println!("Skipped existing profile name(s). Re-run with --replace to overwrite them.");
+    }
+
+    Ok(0)
 }
 
 fn run_auth(command: AuthArgs) -> Result<i32> {

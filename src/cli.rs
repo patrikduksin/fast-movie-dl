@@ -24,11 +24,45 @@ pub enum Commands {
     SpeedTest,
     /// Check local prerequisites
     Doctor,
+    /// Export or import saved profile configs
+    Config {
+        #[command(subcommand)]
+        command: ConfigArgs,
+    },
     /// Manage saved credentials
     Auth {
         #[command(subcommand)]
         command: AuthArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigArgs {
+    /// Export saved profiles to a shareable TOML file
+    Export(ConfigExportArgs),
+    /// Import profiles from a shared TOML file
+    Import(ConfigImportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigExportArgs {
+    /// Output TOML file path
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Export one profile by name instead of all profiles
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigImportArgs {
+    /// Shared TOML file path to import
+    pub file: PathBuf,
+
+    /// Replace existing profiles with matching names
+    #[arg(long)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Subcommand)]
