@@ -1,9 +1,10 @@
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use ftp::types::FileType;
+use ftp::FtpError;
 use ftp::FtpStream;
 use url::Url;
 
@@ -57,6 +58,27 @@ pub struct RemoteUploadProgress {
     pub files_total: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteDownloadSummary {
+    pub target_path: String,
+    pub output_path: PathBuf,
+    pub bytes_downloaded: u64,
+    pub files_downloaded: u64,
+    pub directories_created: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RemoteDownloadProgress {
+    pub current_file: PathBuf,
+    pub source_path: String,
+    pub file_received: u64,
+    pub file_total: u64,
+    pub total_received: u64,
+    pub total_bytes: u64,
+    pub files_done: u64,
+    pub files_total: u64,
+}
+
 pub fn list_ftp_directory(
     ftp_base_url: &str,
     remote_dir: &str,
@@ -104,6 +126,106 @@ pub fn list_ftp_directory(
     Ok(RemoteListing {
         current_dir: normalize_remote_path(remote_dir),
         entries,
+    })
+}
+
+pub fn download_ftp_directory<F>(
+    ftp_url: &str,
+    output_dir: Option<&Path>,
+    credentials: Option<&Credentials>,
+    mut on_progress: F,
+) -> Result<RemoteDownloadSummary>
+where
+    F: FnMut(RemoteDownloadProgress),
+{
+    let url = parse_ftp_base_url(ftp_url)?;
+    let target_path = combine_base_and_relative_path(url.path(), "");
+    if target_path == "/" {
+        bail!("refusing to download FTP server root");
+    }
+
+    let output_base = match output_dir {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().context("failed to read current directory")?,
+    };
+    ensure_local_directory(&output_base)?;
+    let output_path = download_output_root(&output_base, &target_path)?;
+
+    let mut client = connect_ftp(&url, credentials)?;
+    client
+        .transfer_type(FileType::Binary)
+        .context("failed to set FTP binary transfer mode")?;
+
+    let plan = build_download_plan(&mut client, &target_path, &output_path)?;
+    for directory in &plan.directories {
+        ensure_local_directory(directory)?;
+    }
+
+    let mut total_received = 0;
+    let mut files_done = 0;
+
+    for file_item in &plan.files {
+        on_progress(RemoteDownloadProgress {
+            current_file: file_item.local_path.clone(),
+            source_path: file_item.source_path.clone(),
+            file_received: 0,
+            file_total: file_item.size_bytes,
+            total_received,
+            total_bytes: plan.total_bytes,
+            files_done,
+            files_total: plan.files.len() as u64,
+        });
+
+        let file_received = std::cell::Cell::new(0_u64);
+        let progress_callback = std::cell::RefCell::new(&mut on_progress);
+
+        client
+            .retr(&file_item.source_path, |reader| {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file_item.local_path)
+                    .map_err(FtpError::ConnectionError)?;
+                let mut writer =
+                    ProgressWrite::new(file, file_item.size_bytes, |received, total| {
+                        file_received.set(received);
+                        let mut callback = progress_callback.borrow_mut();
+                        (**callback)(RemoteDownloadProgress {
+                            current_file: file_item.local_path.clone(),
+                            source_path: file_item.source_path.clone(),
+                            file_received: received,
+                            file_total: total,
+                            total_received: total_received + received,
+                            total_bytes: plan.total_bytes,
+                            files_done,
+                            files_total: plan.files.len() as u64,
+                        });
+                    });
+
+                io::copy(reader, &mut writer)
+                    .map(|_| ())
+                    .map_err(FtpError::ConnectionError)
+            })
+            .with_context(|| {
+                format!(
+                    "failed to download remote file {} to {}",
+                    file_item.source_path,
+                    file_item.local_path.display()
+                )
+            })?;
+
+        total_received += file_received.get();
+        files_done += 1;
+    }
+
+    let _ = client.quit();
+
+    Ok(RemoteDownloadSummary {
+        target_path,
+        output_path,
+        bytes_downloaded: total_received,
+        files_downloaded: files_done,
+        directories_created: plan.directories.len() as u64,
     })
 }
 
@@ -330,6 +452,99 @@ struct UploadFileItem {
     size_bytes: u64,
 }
 
+#[derive(Debug)]
+struct DownloadPlan {
+    directories: Vec<PathBuf>,
+    files: Vec<DownloadFileItem>,
+    total_bytes: u64,
+}
+
+#[derive(Debug)]
+struct DownloadFileItem {
+    source_path: String,
+    local_path: PathBuf,
+    size_bytes: u64,
+}
+
+fn build_download_plan(
+    client: &mut FtpStream,
+    target_path: &str,
+    output_path: &Path,
+) -> Result<DownloadPlan> {
+    client
+        .cwd(target_path)
+        .with_context(|| format!("remote path is not a directory: {target_path}"))?;
+    let _ = client.cwd("/");
+
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    collect_directory_download_items(
+        client,
+        target_path,
+        output_path,
+        &mut directories,
+        &mut files,
+    )?;
+
+    directories.sort();
+    directories.dedup();
+    directories.sort_by_key(|path| path.components().count());
+
+    let total_bytes = files.iter().map(|item| item.size_bytes).sum();
+
+    Ok(DownloadPlan {
+        directories,
+        files,
+        total_bytes,
+    })
+}
+
+fn collect_directory_download_items(
+    client: &mut FtpStream,
+    current_remote: &str,
+    current_local: &Path,
+    directories: &mut Vec<PathBuf>,
+    files: &mut Vec<DownloadFileItem>,
+) -> Result<()> {
+    client
+        .cwd(current_remote)
+        .with_context(|| format!("failed to change remote directory to {current_remote}"))?;
+    let mut entries = list_current_directory_entries(client)?;
+    let _ = client.cwd("/");
+
+    entries.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+
+    directories.push(current_local.to_path_buf());
+
+    for entry in entries {
+        let remote_path = join_absolute_remote_path(current_remote, &entry.name);
+        let local_path = local_child_path(current_local, &entry.name)?;
+
+        if entry.is_dir {
+            collect_directory_download_items(
+                client,
+                &remote_path,
+                &local_path,
+                directories,
+                files,
+            )?;
+        } else {
+            files.push(DownloadFileItem {
+                source_path: remote_path,
+                local_path,
+                size_bytes: entry.size_bytes.unwrap_or(0),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn build_upload_plan(local_path: &Path, target_path: &str) -> Result<UploadPlan> {
     let metadata = local_path
         .metadata()
@@ -474,6 +689,43 @@ fn ensure_remote_directory(client: &mut FtpStream, target_path: &str) -> Result<
     Ok(())
 }
 
+fn ensure_local_directory(path: &Path) -> Result<()> {
+    if path.exists() {
+        if !path.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create local directory {}", path.display()))?;
+    Ok(())
+}
+
+fn download_output_root(output_base: &Path, target_path: &str) -> Result<PathBuf> {
+    let directory_name = target_path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("remote directory path must include a directory name"))?;
+
+    local_child_path(output_base, directory_name)
+}
+
+fn local_child_path(parent: &Path, child_name: &str) -> Result<PathBuf> {
+    let child = child_name.trim();
+    if child.is_empty()
+        || child == "."
+        || child == ".."
+        || child.contains('/')
+        || child.contains('\\')
+    {
+        bail!("remote path segment is not safe for local output: {child_name}");
+    }
+
+    Ok(parent.join(child))
+}
+
 struct ProgressRead<R, F> {
     inner: R,
     total: u64,
@@ -504,6 +756,43 @@ where
             (self.on_progress)(self.sent, self.total);
         }
         Ok(read)
+    }
+}
+
+struct ProgressWrite<W, F> {
+    inner: W,
+    total: u64,
+    received: u64,
+    on_progress: F,
+}
+
+impl<W, F> ProgressWrite<W, F> {
+    fn new(inner: W, total: u64, on_progress: F) -> Self {
+        Self {
+            inner,
+            total,
+            received: 0,
+            on_progress,
+        }
+    }
+}
+
+impl<W, F> Write for ProgressWrite<W, F>
+where
+    W: Write,
+    F: FnMut(u64, u64),
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if written > 0 {
+            self.received += written as u64;
+            (self.on_progress)(self.received, self.total);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -853,6 +1142,22 @@ mod tests {
             "/movies/2026/sample.mkv"
         );
         assert_eq!(join_absolute_remote_path("/", "sample.mkv"), "/sample.mkv");
+    }
+
+    #[test]
+    fn resolves_directory_download_output_root() {
+        let root = download_output_root(Path::new("/tmp/downloads"), "/movies/Season 1")
+            .expect("expected output root");
+
+        assert_eq!(root, PathBuf::from("/tmp/downloads/Season 1"));
+    }
+
+    #[test]
+    fn rejects_unsafe_local_child_path() {
+        let err = local_child_path(Path::new("/tmp/downloads"), "../movie")
+            .expect_err("expected unsafe segment error");
+
+        assert!(err.to_string().contains("not safe for local output"));
     }
 
     #[test]

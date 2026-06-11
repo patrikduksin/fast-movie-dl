@@ -28,9 +28,9 @@ use crate::probe::{
     resolve_candidates, select_candidate_with_probe, Protocol, SpeedProbeResult, UrlCandidate,
 };
 use crate::remote::{
-    combine_base_and_relative_path, delete_ftp_path, join_remote_path, list_ftp_directory,
-    normalize_remote_path, parent_remote_path, upload_ftp_path, RemoteDeleteSummary, RemoteEntry,
-    RemoteListing,
+    combine_base_and_relative_path, delete_ftp_path, download_ftp_directory, join_remote_path,
+    list_ftp_directory, normalize_remote_path, parent_remote_path, upload_ftp_path,
+    RemoteDeleteSummary, RemoteEntry, RemoteListing,
 };
 use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunOutcome};
 
@@ -232,6 +232,40 @@ impl FormState {
         })
     }
 
+    fn directory_download_input(&self) -> Result<DirectoryDownloadInput> {
+        let ftp_base_url = self.ftp_base_url.trim();
+        let remote_path = self.remote_path.trim();
+
+        let _ = parse_base_url(ftp_base_url, Protocol::Ftp)?;
+
+        if remote_path.is_empty() {
+            bail!("remote directory path cannot be empty");
+        }
+
+        let output_dir = if self.output_dir.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(self.output_dir.trim()))
+        };
+
+        let credentials = if self.username.trim().is_empty() {
+            None
+        } else {
+            Some(Credentials {
+                username: self.username.trim().to_string(),
+                password: self.password.clone(),
+            })
+        };
+
+        Ok(DirectoryDownloadInput {
+            ftp_base_url: ftp_base_url.to_string(),
+            remote_path: remote_path.to_string(),
+            output_dir,
+            credentials,
+            remember_keychain: self.remember_keychain,
+        })
+    }
+
     fn upload_input(&self, fallback_remote_dir: &str) -> Result<UploadInput> {
         let ftp_base_url = self.ftp_base_url.trim();
         let _ = parse_base_url(ftp_base_url, Protocol::Ftp)?;
@@ -290,6 +324,15 @@ struct DownloadInput {
 }
 
 #[derive(Debug, Clone)]
+struct DirectoryDownloadInput {
+    ftp_base_url: String,
+    remote_path: String,
+    output_dir: Option<PathBuf>,
+    credentials: Option<Credentials>,
+    remember_keychain: bool,
+}
+
+#[derive(Debug, Clone)]
 struct UploadInput {
     ftp_base_url: String,
     remote_path: String,
@@ -301,6 +344,7 @@ struct UploadInput {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TransferKind {
     Download,
+    DirectoryDownload,
     Upload,
 }
 
@@ -732,6 +776,36 @@ impl TuiApp {
         });
     }
 
+    fn start_directory_download(&mut self) {
+        if self.worker.is_some() {
+            return;
+        }
+
+        let input = match self.form.directory_download_input() {
+            Ok(input) => input,
+            Err(err) => {
+                self.status = Some(format!("Invalid directory download input: {err}"));
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.worker = Some(rx);
+        self.screen = Screen::Running;
+        self.result = None;
+        self.result_error = None;
+        self.running_log_lines.clear();
+        self.running_log_path = None;
+        self.running_progress = None;
+        self.running_kind = TransferKind::DirectoryDownload;
+        self.status = Some("Directory download started".to_string());
+
+        thread::spawn(move || {
+            let result = run_directory_download_job(input, &tx);
+            let _ = tx.send(DownloadWorkerEvent::Finished(result));
+        });
+    }
+
     fn start_upload(&mut self) {
         if self.worker.is_some() {
             return;
@@ -834,6 +908,7 @@ impl TuiApp {
                 }
             }
             KeyCode::Char('r') => self.reload_browser_listing(),
+            KeyCode::Char('d') => self.download_selected_browser_entry(),
             KeyCode::Char('u') => self.start_upload(),
             KeyCode::Delete | KeyCode::Char('x') => self.confirm_delete_selected_browser_entry(),
             KeyCode::Char('e') => {
@@ -868,6 +943,34 @@ impl TuiApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn download_selected_browser_entry(&mut self) {
+        if self.listing_worker.is_some() {
+            return;
+        }
+
+        let Some(selected) = self.browser_entries.get(self.browser_selected).cloned() else {
+            self.status = Some("No remote entry selected".to_string());
+            return;
+        };
+
+        let selected_path = join_remote_path(&self.browser_current_dir, &selected.name);
+        self.form.remote_path = selected_path;
+
+        if selected.is_dir {
+            self.status = Some(format!(
+                "Selected directory {}. Starting recursive FTP download...",
+                self.form.remote_path
+            ));
+            self.start_directory_download();
+        } else {
+            self.status = Some(format!(
+                "Selected file {}. Starting probe + download...",
+                self.form.remote_path
+            ));
+            self.start_download();
         }
     }
 
@@ -1053,6 +1156,7 @@ impl TuiApp {
             KeyCode::Char('e') | KeyCode::Enter => self.screen = Screen::Form,
             KeyCode::Char('r') => match self.result.as_ref().map(|summary| summary.kind) {
                 Some(TransferKind::Upload) => self.start_upload(),
+                Some(TransferKind::DirectoryDownload) => self.start_directory_download(),
                 _ => self.start_download(),
             },
             _ => {}
@@ -1217,7 +1321,7 @@ impl TuiApp {
 
         let footer = Paragraph::new(
             self.status.as_deref().unwrap_or(
-                "j/k move, Enter open dir or download file, u upload local file here, x/Delete delete, h/backspace parent, r refresh, e edit, q back.",
+                "j/k move, Enter open dir or download file, d download selected, u upload local file here, x/Delete delete, h/backspace parent, r refresh, e edit, q back.",
             ),
         )
         .block(Block::default().borders(Borders::ALL).title("Help"))
@@ -1396,6 +1500,7 @@ impl TuiApp {
 
         let transfer_label = match self.running_kind {
             TransferKind::Download => "Download",
+            TransferKind::DirectoryDownload => "Directory download",
             TransferKind::Upload => "Upload",
         };
 
@@ -1406,6 +1511,15 @@ impl TuiApp {
         let target_line = match self.running_kind {
             TransferKind::Download => format!(
                 "Remote path: {}\nOutput dir: {}",
+                self.form.remote_path,
+                if self.form.output_dir.trim().is_empty() {
+                    "(current directory)"
+                } else {
+                    self.form.output_dir.trim()
+                }
+            ),
+            TransferKind::DirectoryDownload => format!(
+                "Remote directory: {}\nOutput dir: {}",
                 self.form.remote_path,
                 if self.form.output_dir.trim().is_empty() {
                     "(current directory)"
@@ -1497,11 +1611,15 @@ impl TuiApp {
             if summary.outcome.success {
                 match summary.kind {
                     TransferKind::Download => ("Download finished successfully", Color::Green),
+                    TransferKind::DirectoryDownload => {
+                        ("Directory download finished successfully", Color::Green)
+                    }
                     TransferKind::Upload => ("Upload finished successfully", Color::Green),
                 }
             } else {
                 match summary.kind {
                     TransferKind::Download => ("Download failed", Color::Red),
+                    TransferKind::DirectoryDownload => ("Directory download failed", Color::Red),
                     TransferKind::Upload => ("Upload failed", Color::Red),
                 }
             }
@@ -1527,6 +1645,10 @@ impl TuiApp {
 
             if summary.kind == TransferKind::Upload {
                 lines.push(Line::from("Probe results: not used for FTP upload"));
+            } else if summary.kind == TransferKind::DirectoryDownload {
+                lines.push(Line::from(
+                    "Probe results: not used for recursive FTP directory download",
+                ));
             } else if summary.probes.is_empty() {
                 lines.push(Line::from("Probe results: unavailable"));
             } else {
@@ -1576,7 +1698,7 @@ impl TuiApp {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("aria2 Log (tail)"),
+                    .title("Transfer Log (tail)"),
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(logs, chunks[2]);
@@ -1733,6 +1855,96 @@ fn run_download_job(
         probes: selection.all_probes,
         auth_hint: !outcome.success && looks_like_auth_error(&outcome.combined_log),
         outcome,
+        log_path: log_path.display().to_string(),
+    })
+}
+
+fn run_directory_download_job(
+    input: DirectoryDownloadInput,
+    events: &mpsc::Sender<DownloadWorkerEvent>,
+) -> Result<TransferSummary> {
+    let store = MacKeychainStore;
+    let log_path = create_tui_log_path();
+    let _ = events.send(DownloadWorkerEvent::LogPath(log_path.display().to_string()));
+    let _ = events.send(DownloadWorkerEvent::Status(
+        "Preparing recursive FTP directory download...".to_string(),
+    ));
+
+    let ftp_url = build_remote_url(&input.ftp_base_url, &input.remote_path, Protocol::Ftp)?;
+    let host = ftp_url
+        .host_str()
+        .ok_or_else(|| AppError::MissingHost(ftp_url.to_string()))?
+        .to_string();
+    let saved_credentials = store.get(&host)?;
+    let (credentials, _) = select_credentials(input.credentials.clone(), saved_credentials);
+
+    let mut log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("failed to create log file {}", log_path.display()))?;
+    let _ = writeln!(
+        log_file,
+        "fast-movie-dl tui directory download log\nftp_url={}\noutput_dir={}\n",
+        redact_url(&ftp_url),
+        input
+            .output_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(current directory)".to_string())
+    );
+
+    let _ = events.send(DownloadWorkerEvent::Status(format!(
+        "Downloading directory {}...",
+        input.remote_path
+    )));
+
+    let summary = download_ftp_directory(
+        ftp_url.as_str(),
+        input.output_dir.as_deref(),
+        credentials.as_ref(),
+        |progress| {
+            let _ = events.send(DownloadWorkerEvent::Progress {
+                sent: progress.total_received,
+                total: progress.total_bytes,
+            });
+            let _ = events.send(DownloadWorkerEvent::Status(format!(
+                "Downloading {}/{}: {}",
+                progress.files_done + 1,
+                progress.files_total.max(1),
+                progress.source_path
+            )));
+        },
+    )?;
+
+    let log_line = format!(
+        "Downloaded {} to {} ({} across {} file(s), {} directories)",
+        summary.target_path,
+        summary.output_path.display(),
+        format_bytes_human(summary.bytes_downloaded),
+        summary.files_downloaded,
+        summary.directories_created
+    );
+    let _ = writeln!(log_file, "{log_line}");
+    let _ = events.send(DownloadWorkerEvent::LogLine(log_line.clone()));
+
+    if input.remember_keychain {
+        if let Some(creds) = &credentials {
+            store
+                .set(&host, creds)
+                .with_context(|| format!("failed to save credentials for host {host}"))?;
+        }
+    }
+
+    Ok(TransferSummary {
+        kind: TransferKind::DirectoryDownload,
+        reason: "Recursive FTP directory download".to_string(),
+        chosen_url: redact_url(&ftp_url),
+        output_path: summary.output_path.display().to_string(),
+        probes: Vec::new(),
+        auth_hint: false,
+        outcome: RunOutcome {
+            success: true,
+            exit_code: Some(0),
+            combined_log: log_line,
+        },
         log_path: log_path.display().to_string(),
     })
 }
@@ -1953,6 +2165,7 @@ fn protocol_name(protocol: Protocol) -> &'static str {
 fn transfer_kind_label(kind: TransferKind) -> &'static str {
     match kind {
         TransferKind::Download => "download",
+        TransferKind::DirectoryDownload => "directory download",
         TransferKind::Upload => "upload",
     }
 }
