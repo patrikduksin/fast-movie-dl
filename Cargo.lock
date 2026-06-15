@@ -727,6 +727,7 @@ dependencies = [
  "ftp",
  "indicatif",
  "keyring",
+ "percent-encoding",
  "ratatui",
  "serde",
  "tempfile",

@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use ftp::types::FileType;
 use ftp::FtpError;
 use ftp::FtpStream;
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::auth::Credentials;
@@ -85,7 +86,7 @@ pub fn list_ftp_directory(
     credentials: Option<&Credentials>,
 ) -> Result<RemoteListing> {
     let base_url = parse_ftp_base_url(ftp_base_url)?;
-    let target_dir = combine_base_and_relative_path(base_url.path(), remote_dir);
+    let target_dir = combine_base_and_relative_path(&ftp_url_path(&base_url)?, remote_dir);
     let mut client = connect_ftp(&base_url, credentials)?;
 
     client
@@ -139,7 +140,7 @@ where
     F: FnMut(RemoteDownloadProgress),
 {
     let url = parse_ftp_base_url(ftp_url)?;
-    let target_path = combine_base_and_relative_path(url.path(), "");
+    let target_path = combine_base_and_relative_path(&ftp_url_path(&url)?, "");
     if target_path == "/" {
         bail!("refusing to download FTP server root");
     }
@@ -229,6 +230,16 @@ where
     })
 }
 
+pub fn ftp_path_is_directory(ftp_url: &str, credentials: Option<&Credentials>) -> Result<bool> {
+    let url = parse_ftp_base_url(ftp_url)?;
+    let target_path = combine_base_and_relative_path(&ftp_url_path(&url)?, "");
+    let mut client = connect_ftp(&url, credentials)?;
+    let is_directory = client.cwd(&target_path).is_ok();
+    let _ = client.quit();
+
+    Ok(is_directory)
+}
+
 pub fn upload_ftp_path<F>(
     local_path: &Path,
     ftp_url: &str,
@@ -239,7 +250,7 @@ where
     F: FnMut(RemoteUploadProgress),
 {
     let url = parse_ftp_base_url(ftp_url)?;
-    let target_path = resolve_upload_target_path(local_path, url.path())?;
+    let target_path = resolve_upload_target_path(local_path, &ftp_url_path(&url)?)?;
     let plan = build_upload_plan(local_path, &target_path)?;
 
     let mut client = connect_ftp(&url, credentials)?;
@@ -315,7 +326,7 @@ pub fn delete_ftp_path(
     recursive: bool,
 ) -> Result<RemoteDeleteSummary> {
     let url = parse_ftp_base_url(ftp_url)?;
-    let target_path = combine_base_and_relative_path(url.path(), "");
+    let target_path = combine_base_and_relative_path(&ftp_url_path(&url)?, "");
     if target_path == "/" {
         bail!("refusing to delete FTP server root");
     }
@@ -352,7 +363,7 @@ pub fn delete_ftp_path(
 
 pub fn remote_upload_path_from_url(local_path: &Path, ftp_url: &str) -> Result<String> {
     let url = parse_ftp_base_url(ftp_url)?;
-    resolve_upload_target_path(local_path, url.path())
+    resolve_upload_target_path(local_path, &ftp_url_path(&url)?)
 }
 
 pub fn normalize_remote_path(value: &str) -> String {
@@ -400,6 +411,13 @@ fn parse_ftp_base_url(value: &str) -> Result<Url> {
         bail!("FTP base URL must use ftp");
     }
     Ok(parsed)
+}
+
+fn ftp_url_path(url: &Url) -> Result<String> {
+    percent_decode_str(url.path())
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .with_context(|| format!("FTP URL path is not valid UTF-8: {}", url.path()))
 }
 
 fn ftp_server_address(url: &Url) -> Result<String> {
@@ -1150,6 +1168,16 @@ mod tests {
             .expect("expected output root");
 
         assert_eq!(root, PathBuf::from("/tmp/downloads/Season 1"));
+    }
+
+    #[test]
+    fn decodes_ftp_url_path_segments() {
+        let url = Url::parse("ftp://files.example.com/Downloads/Season%201%20(1992-93)")
+            .expect("expected valid URL");
+
+        let path = ftp_url_path(&url).expect("expected decoded path");
+
+        assert_eq!(path, "/Downloads/Season 1 (1992-93)");
     }
 
     #[test]

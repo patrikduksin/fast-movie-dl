@@ -28,9 +28,9 @@ use crate::probe::{
     resolve_candidates, select_candidate_with_probe, Protocol, SpeedProbeResult, UrlCandidate,
 };
 use crate::remote::{
-    combine_base_and_relative_path, delete_ftp_path, download_ftp_directory, join_remote_path,
-    list_ftp_directory, normalize_remote_path, parent_remote_path, upload_ftp_path,
-    RemoteDeleteSummary, RemoteEntry, RemoteListing,
+    combine_base_and_relative_path, delete_ftp_path, download_ftp_directory, ftp_path_is_directory,
+    join_remote_path, list_ftp_directory, normalize_remote_path, parent_remote_path,
+    upload_ftp_path, RemoteDeleteSummary, RemoteEntry, RemoteListing,
 };
 use crate::runner::{execute_aria2_capture_with_sink, looks_like_auth_error, RunOutcome};
 
@@ -1773,17 +1773,44 @@ fn run_download_job(
     input: DownloadInput,
     events: &mpsc::Sender<DownloadWorkerEvent>,
 ) -> Result<TransferSummary> {
-    let aria2_path = find_aria2().ok_or(AppError::MissingAria2)?;
     let store = MacKeychainStore;
+
+    let http_url = build_remote_url(&input.http_base_url, &input.remote_path, Protocol::Http)?;
+    let ftp_url = build_remote_url(&input.ftp_base_url, &input.remote_path, Protocol::Ftp)?;
+    let ftp_host = ftp_url
+        .host_str()
+        .ok_or_else(|| AppError::MissingHost(ftp_url.to_string()))?
+        .to_string();
+    let saved_ftp_credentials = store.get(&ftp_host)?;
+    let (ftp_credentials, _) = select_credentials(input.credentials.clone(), saved_ftp_credentials);
+
+    let _ = events.send(DownloadWorkerEvent::Status(
+        "Checking whether selected FTP path is a directory...".to_string(),
+    ));
+
+    if ftp_path_is_directory(ftp_url.as_str(), ftp_credentials.as_ref()).unwrap_or(false) {
+        let _ = events.send(DownloadWorkerEvent::Status(
+            "Selected FTP path is a directory. Starting recursive download...".to_string(),
+        ));
+        return run_directory_download_job(
+            DirectoryDownloadInput {
+                ftp_base_url: input.ftp_base_url,
+                remote_path: input.remote_path,
+                output_dir: input.output_dir,
+                credentials: ftp_credentials,
+                remember_keychain: input.remember_keychain,
+            },
+            events,
+        );
+    }
+
+    let aria2_path = find_aria2().ok_or(AppError::MissingAria2)?;
     let log_path = create_tui_log_path();
     let _ = events.send(DownloadWorkerEvent::LogPath(log_path.display().to_string()));
 
     let _ = events.send(DownloadWorkerEvent::Status(
         "Preparing URL candidates...".to_string(),
     ));
-
-    let http_url = build_remote_url(&input.http_base_url, &input.remote_path, Protocol::Http)?;
-    let ftp_url = build_remote_url(&input.ftp_base_url, &input.remote_path, Protocol::Ftp)?;
 
     let candidates = resolve_candidates(
         http_url.as_str(),
